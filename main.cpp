@@ -1,0 +1,496 @@
+/**
+ * @file   main.cpp
+ * @brief  Lid‑Driven Cavity – explicit staggered‑grid solver with upwind convection.
+ * @author Tyler Jones
+ * @date   2025‑06‑22
+ * @version 2.3 - Added data export capabilities with results folder
+ */
+
+#include <iostream>
+#include <vector>
+#include <cmath>
+#include <algorithm>
+#include <fstream>
+#include <iomanip>
+#include <sstream>
+#include <filesystem>
+
+using Field = std::vector<std::vector<double>>;
+static Field makeField(int rows, int cols, double val = 0.0) {
+    return Field(rows, std::vector<double>(cols, val));
+}
+
+// Structure to store residual history
+struct ResidualData {
+    double time;
+    int step;
+    int ppe_iterations;
+    double ppe_residual;
+    double u_max;
+    double v_max;
+    double u_rms;
+    double v_rms;
+};
+
+// Function to create results directory
+void createResultsDirectory() {
+    try {
+        if (!std::filesystem::exists("results")) {
+            std::filesystem::create_directory("results");
+            std::cout << "Created results directory" << std::endl;
+        }
+    } catch (const std::filesystem::filesystem_error& e) {
+        std::cerr << "Error creating results directory: " << e.what() << std::endl;
+        std::cerr << "Files will be saved in current directory instead." << std::endl;
+    }
+}
+
+// Function to write VTK file for ParaView visualization
+void writeVTK(const Field& p, const Field& u, const Field& v, 
+              int imin, int imax, int jmin, int jmax, 
+              double h, int step, double time) {
+    
+    std::ostringstream filename;
+    filename << "results/cavity_" << std::setfill('0') << std::setw(6) << step << ".vtk";
+    
+    std::ofstream file(filename.str());
+    if (!file.is_open()) {
+        std::cerr << "Error: Could not open " << filename.str() << " for writing!" << std::endl;
+        // Try fallback to current directory
+        std::ostringstream fallback_filename;
+        fallback_filename << "cavity_" << std::setfill('0') << std::setw(6) << step << ".vtk";
+        file.open(fallback_filename.str());
+        if (!file.is_open()) {
+            std::cerr << "Error: Could not open fallback file " << fallback_filename.str() << " either!" << std::endl;
+            return;
+        }
+        std::cout << "    Wrote VTK file: " << fallback_filename.str() << " (fallback location)" << std::endl;
+    } else {
+        std::cout << "    Wrote VTK file: " << filename.str() << std::endl;
+    }
+    
+    int nx = imax - imin + 1;
+    int ny = jmax - jmin + 1;
+    int npoints = nx * ny;
+    int ncells = (nx-1) * (ny-1);
+    
+    // VTK header
+    file << "# vtk DataFile Version 3.0\n";
+    file << "Lid-driven cavity flow at t=" << std::fixed << std::setprecision(4) << time << "\n";
+    file << "ASCII\n";
+    file << "DATASET STRUCTURED_GRID\n";
+    file << "DIMENSIONS " << nx << " " << ny << " 1\n";
+    file << "POINTS " << npoints << " float\n";
+    
+    // Write grid points (cell centers)
+    for (int j = jmin; j <= jmax; ++j) {
+        for (int i = imin; i <= imax; ++i) {
+            double x = (i - 0.5) * h;  // Cell center x-coordinate
+            double y = (j - 0.5) * h;  // Cell center y-coordinate
+            file << std::fixed << std::setprecision(6) << x << " " << y << " 0.0\n";
+        }
+    }
+    
+    // Point data
+    file << "POINT_DATA " << npoints << "\n";
+    
+    // Pressure field
+    file << "SCALARS pressure float 1\n";
+    file << "LOOKUP_TABLE default\n";
+    for (int j = jmin; j <= jmax; ++j) {
+        for (int i = imin; i <= imax; ++i) {
+            file << std::fixed << std::setprecision(6) << p[j][i] << "\n";
+        }
+    }
+    
+    // Velocity vectors (interpolated to cell centers)
+    file << "VECTORS velocity float\n";
+    for (int j = jmin; j <= jmax; ++j) {
+        for (int i = imin; i <= imax; ++i) {
+            // Interpolate u and v to cell centers
+            double u_center = 0.5 * (u[j][i] + u[j][i-1]);
+            double v_center = 0.5 * (v[j][i] + v[j-1][i]);
+            file << std::fixed << std::setprecision(6) 
+                 << u_center << " " << v_center << " 0.0\n";
+        }
+    }
+    
+    // Velocity magnitude
+    file << "SCALARS velocity_magnitude float 1\n";
+    file << "LOOKUP_TABLE default\n";
+    for (int j = jmin; j <= jmax; ++j) {
+        for (int i = imin; i <= imax; ++i) {
+            double u_center = 0.5 * (u[j][i] + u[j][i-1]);
+            double v_center = 0.5 * (v[j][i] + v[j-1][i]);
+            double mag = std::sqrt(u_center*u_center + v_center*v_center);
+            file << std::fixed << std::setprecision(6) << mag << "\n";
+        }
+    }
+    
+    // Vorticity (curl of velocity)
+    file << "SCALARS vorticity float 1\n";
+    file << "LOOKUP_TABLE default\n";
+    for (int j = jmin; j <= jmax; ++j) {
+        for (int i = imin; i <= imax; ++i) {
+            // Compute vorticity: ∂v/∂x - ∂u/∂y
+            double dvdx, dudy;
+            
+            // Central differences for interior points
+            if (i > imin && i < imax && j > jmin && j < jmax) {
+                dvdx = (0.5 * (v[j][i+1] + v[j-1][i+1]) - 0.5 * (v[j][i-1] + v[j-1][i-1])) / (2.0 * h);
+                dudy = (0.5 * (u[j+1][i] + u[j+1][i-1]) - 0.5 * (u[j-1][i] + u[j-1][i-1])) / (2.0 * h);
+            } else {
+                // Use one-sided differences at boundaries
+                dvdx = 0.0;  // Simplified for boundaries
+                dudy = 0.0;
+            }
+            
+            double vorticity = dvdx - dudy;
+            file << std::fixed << std::setprecision(6) << vorticity << "\n";
+        }
+    }
+    
+    file.close();
+}
+
+// Function to write residual data to file
+void writeResidualData(const std::vector<ResidualData>& residuals, const std::string& filename) {
+    std::string filepath = "results/" + filename;
+    std::ofstream file(filepath);
+    if (!file.is_open()) {
+        std::cerr << "Error: Could not open " << filepath << " for writing!" << std::endl;
+        // Try fallback to current directory
+        file.open(filename);
+        if (!file.is_open()) {
+            std::cerr << "Error: Could not open fallback file " << filename << " either!" << std::endl;
+            return;
+        }
+        std::cout << "Wrote residual data to: " << filename << " (fallback location)" << std::endl;
+        filepath = filename;
+    } else {
+        std::cout << "Wrote residual data to: " << filepath << std::endl;
+    }
+    
+    // Header
+    file << "# Residual history for lid-driven cavity simulation\n";
+    file << "# Columns: Step Time PPE_Iterations PPE_Residual U_max V_max U_rms V_rms\n";
+    file << std::fixed << std::setprecision(8);
+    
+    for (const auto& data : residuals) {
+        file << data.step << " " 
+             << data.time << " " 
+             << data.ppe_iterations << " " 
+             << data.ppe_residual << " " 
+             << data.u_max << " " 
+             << data.v_max << " " 
+             << data.u_rms << " " 
+             << data.v_rms << "\n";
+    }
+    
+    file.close();
+}
+
+int main() {
+    std::cout << ">>> Hello from cavity solver (central differences)\n";
+    
+    // Create results directory
+    createResultsDirectory();
+    
+    //── Physical & numerical parameters ───────────────────────────────────
+    constexpr double L        = 1.0;    // cavity length (m)
+    constexpr int    N_int    = 32;     // interior p‑nodes per side
+    constexpr double Re       = 100.0;  // Reynolds number
+    constexpr double U_lid    = 1.0;    // lid velocity (m/s)
+    constexpr double CFL      = 0.5;    // CFL safety factor
+    constexpr double t_final  = 10.0;   // end time (s)
+    constexpr double tol_P    = 1e-6;   // Poisson tolerance
+    constexpr double omega    = 1.6;    // SOR relaxation parameter
+    constexpr int    max_iter = 1000;   // Maximum SOR iterations
+    
+    //── Output control parameters ─────────────────────────────────────────
+    constexpr int vtk_interval = 100;     // Write VTK every N steps
+    constexpr int residual_interval = 10; // Record residuals every N steps
+    constexpr int print_interval = 500;   // Print progress every N steps
+
+    //── Derived grid metrics and parameters ───────────────────────────────
+    double nu = U_lid * L / Re;
+    double h = L / N_int;
+
+    int imin = 1;          // first interior index (x)
+    int imax = N_int;      // last interior index (x)
+    int jmin = 1;          // first interior index (y)
+    int jmax = N_int;      // last interior index (y)
+
+    double dt = CFL * std::min(0.25 * h * h / nu, h / U_lid);
+    int nSteps = static_cast<int>(t_final / dt);
+
+    //── Data storage for history tracking ─────────────────────────────────
+    std::vector<ResidualData> residual_history;
+    residual_history.reserve(nSteps / residual_interval + 1);
+
+    //── Allocate fields ───────────────────────────────────────────────────
+    Field p = makeField(jmax + 2, imax + 2);  
+    Field u = makeField(jmax + 2, imax + 1);  
+    Field u_star = makeField(jmax + 2, imax + 1);
+    Field v = makeField(jmax + 1, imax + 2);  
+    Field v_star = makeField(jmax + 1, imax + 2);
+    Field rhs = makeField(jmax + 2, imax + 2);
+    
+    std::cout 
+        << "Grid: " << N_int << "×" << N_int << " (h=" << h << ")\n"
+        << "Time: dt=" << dt << ", nSteps=" << nSteps << ", t_final=" << t_final << "\n"
+        << "Re=" << Re << ", nu=" << nu << ", CFL=" << CFL << "\n"
+        << "Output: VTK every " << vtk_interval << " steps, residuals every " 
+        << residual_interval << " steps\n";
+
+    //── Apply boundary conditions (ghost layers) ─────────────────────────
+    auto applyBC = [&]() {
+        // North lid (moving wall at j = jmax+1)
+        for (int i = 0; i <= imax; ++i) {
+            u[jmax+1][i] = 2.0 * U_lid - u[jmax][i];  // Moving lid BC
+        }
+        for (int i = 0; i <= imax+1; ++i) {
+            v[jmax][i] = 0.0;  // No penetration at lid
+        }
+
+        // South wall (no-slip at j = 0)
+        for (int i = 0; i <= imax; ++i) {
+            u[0][i] = -u[1][i];  // No-slip BC
+        }
+        for (int i = 0; i <= imax+1; ++i) {
+            v[0][i] = 0.0;  // No penetration at south wall
+        }
+
+        // East wall (no-slip at i = imax+1)
+        for (int j = 0; j <= jmax+1; ++j) {
+            u[j][imax] = 0.0;  // No penetration at east wall
+        }
+        for (int j = 0; j <= jmax; ++j) {
+            v[j][imax+1] = -v[j][imax];  // No-slip BC
+        }
+
+        // West wall (no-slip at i = 0)
+        for (int j = 0; j <= jmax+1; ++j) {
+            u[j][0] = 0.0;  // No penetration at west wall
+        }
+        for (int j = 0; j <= jmax; ++j) {
+            v[j][0] = -v[j][1];  // No-slip BC
+        }
+    };
+
+    //── Predictor step: compute u*, v* ────────────────────────────────────
+    auto predictor = [&]() {
+        double h2_inv = 1.0 / (h * h);
+        double h_inv = 1.0 / h;
+        
+        // Compute u* from momentum equation (without pressure gradient)
+        for (int j = jmin; j <= jmax; ++j) {
+            for (int i = imin; i <= imax-1; ++i) {
+                // Viscous term: ν(∇⋅∇)u
+                double Term1_U = nu * ((u[j][i+1] - 2.0*u[j][i] + u[j][i-1]) * h2_inv +
+                                      (u[j+1][i] - 2.0*u[j][i] + u[j-1][i]) * h2_inv);
+                
+                // Convective term: ∂(u²)/∂x 
+                double u_east = 0.5 * (u[j][i] + u[j][i+1]);
+                double u_west = 0.5 * (u[j][i-1] + u[j][i]);
+                double Term2_U = h_inv * (u_east*u_east - u_west*u_west);
+                
+                // Convective term: ∂(vu)/∂y
+                double v_north = 0.25 * (v[j][i] + v[j][i+1]);
+                double v_south = 0.25 * (v[j-1][i] + v[j-1][i+1]);
+                double u_north = 0.5 * (u[j+1][i] + u[j][i]);
+                double u_south = 0.5 * (u[j-1][i] + u[j][i]);
+                double Term3_U = h_inv * (v_north * u_north - v_south * u_south);
+                
+                // Explicit Euler step
+                u_star[j][i] = u[j][i] + dt * (Term1_U - Term2_U - Term3_U);
+            }
+        }
+        
+        // Compute v* from momentum equation (without pressure gradient)
+        for (int j = jmin; j <= jmax-1; ++j) {
+            for (int i = imin; i <= imax; ++i) {
+                // Viscous term: ν(∇⋅∇)v
+                double Term1_V = nu * ((v[j][i+1] - 2.0*v[j][i] + v[j][i-1]) * h2_inv +
+                                      (v[j+1][i] - 2.0*v[j][i] + v[j-1][i]) * h2_inv);
+                
+                // Convective term: ∂(v²)/∂y (central differences, gamma=0)
+                double v_north = 0.5 * (v[j][i] + v[j+1][i]);
+                double v_south = 0.5 * (v[j-1][i] + v[j][i]);
+                double Term2_V = h_inv * (v_north*v_north - v_south*v_south);
+                
+                // Convective term: ∂(uv)/∂x (central differences, gamma=0)
+                double u_east = 0.25 * (u[j][i] + u[j+1][i]);
+                double u_west = 0.25 * (u[j][i-1] + u[j+1][i-1]);
+                double v_east = 0.5 * (v[j][i+1] + v[j][i]);
+                double v_west = 0.5 * (v[j][i-1] + v[j][i]);
+                double Term3_V = h_inv * (u_east * v_east - u_west * v_west);
+                
+                // Explicit Euler step
+                v_star[j][i] = v[j][i] + dt * (Term1_V - Term2_V - Term3_V);
+            }
+        }
+    };
+
+    //── Pressure Poisson Equation solver using SOR ───────────────────────
+    auto solvePressure = [&]() -> std::pair<int, double> {
+        double h_inv = 1.0 / h;
+        double dt_inv = 1.0 / dt;
+        
+        // Build RHS of pressure Poisson equation: ∇·u*/dt
+        for (int j = jmin; j <= jmax; ++j) {
+            for (int i = imin; i <= imax; ++i) {
+                double div_u_star = h_inv * ((u_star[j][i] - u_star[j][i-1]) + 
+                                            (v_star[j][i] - v_star[j-1][i]));
+                rhs[j][i] = dt_inv * div_u_star;
+            }
+        }
+        
+        // SOR iterations
+        int final_iter = 0;
+        double final_residual = 0.0;
+        
+        for (int iter = 0; iter < max_iter; ++iter) {
+            double residual = 0.0;
+            
+            for (int j = jmin; j <= jmax; ++j) {
+                for (int i = imin; i <= imax; ++i) {
+                    double p_old = p[j][i];
+                    
+                    // Five-point stencil for Laplacian
+                    double p_new = 0.25 * (p[j][i+1] + p[j][i-1] + p[j+1][i] + p[j-1][i] 
+                                          - h * h * rhs[j][i]);
+                    
+                    // SOR update
+                    p[j][i] = (1.0 - omega) * p_old + omega * p_new;
+                    
+                    // Accumulate residual
+                    double res_local = std::abs(p[j][i] - p_old);
+                    residual = std::max(residual, res_local);
+                }
+            }
+            
+            // Set reference pressure (p[jmin][imin] = 0 to fix constant)
+            double p_ref = p[jmin][imin];
+            for (int j = jmin; j <= jmax; ++j) {
+                for (int i = imin; i <= imax; ++i) {
+                    p[j][i] -= p_ref;
+                }
+            }
+            
+            final_iter = iter + 1;
+            final_residual = residual;
+            
+            // Check convergence
+            if (residual < tol_P) {
+                break;
+            }
+        }
+        
+        return {final_iter, final_residual};
+    };
+
+    //── Corrector step: apply pressure gradient to get final u, v ─────────
+    auto corrector = [&]() {
+        double dt_h_inv = dt / h;
+        
+        // Correct u-velocities
+        for (int j = jmin; j <= jmax; ++j) {
+            for (int i = imin; i <= imax-1; ++i) {
+                u[j][i] = u_star[j][i] - dt_h_inv * (p[j][i+1] - p[j][i]);
+            }
+        }
+        
+        // Correct v-velocities
+        for (int j = jmin; j <= jmax-1; ++j) {
+            for (int i = imin; i <= imax; ++i) {
+                v[j][i] = v_star[j][i] - dt_h_inv * (p[j+1][i] - p[j][i]);
+            }
+        }
+    };
+
+    //── Function to compute velocity statistics ───────────────────────────
+    auto computeVelocityStats = [&]() -> std::tuple<double, double, double, double> {
+        double u_max = 0.0, v_max = 0.0;
+        double u_sum_sq = 0.0, v_sum_sq = 0.0;
+        int u_count = 0, v_count = 0;
+        
+        // U-velocity statistics
+        for (int j = jmin; j <= jmax; ++j) {
+            for (int i = imin; i <= imax-1; ++i) {
+                u_max = std::max(u_max, std::abs(u[j][i]));
+                u_sum_sq += u[j][i] * u[j][i];
+                u_count++;
+            }
+        }
+        
+        // V-velocity statistics
+        for (int j = jmin; j <= jmax-1; ++j) {
+            for (int i = imin; i <= imax; ++i) {
+                v_max = std::max(v_max, std::abs(v[j][i]));
+                v_sum_sq += v[j][i] * v[j][i];
+                v_count++;
+            }
+        }
+        
+        double u_rms = std::sqrt(u_sum_sq / u_count);
+        double v_rms = std::sqrt(v_sum_sq / v_count);
+        
+        return {u_max, v_max, u_rms, v_rms};
+    };
+
+    //── Time-stepping loop ────────────────────────────────────────────────
+    std::cout << ">> Entering time loop\n";
+    
+    // Write initial condition
+    writeVTK(p, u, v, imin, imax, jmin, jmax, h, 0, 0.0);
+    
+    for (int n = 0; n < nSteps; ++n) {
+        double current_time = n * dt;
+        
+        applyBC();
+        predictor();
+        auto [ppe_iter, ppe_res] = solvePressure();
+        corrector();
+
+        // Record residual data
+        if (n % residual_interval == 0) {
+            auto [u_max, v_max, u_rms, v_rms] = computeVelocityStats();
+            residual_history.push_back({current_time, n, ppe_iter, ppe_res, u_max, v_max, u_rms, v_rms});
+        }
+
+        // Write VTK output
+        if (n % vtk_interval == 0 && n > 0) {
+            writeVTK(p, u, v, imin, imax, jmin, jmax, h, n, current_time);
+        }
+
+        // Print progress
+        if (n % print_interval == 0) {
+            auto [u_max, v_max, u_rms, v_rms] = computeVelocityStats();
+            std::cout << "step " << n << "/" << nSteps
+                      << "  t=" << std::fixed << std::setprecision(4) << current_time 
+                      << "  |u|_max=" << std::setprecision(6) << u_max
+                      << "  |v|_max=" << v_max 
+                      << "  PPE_iter=" << ppe_iter << '\n';
+        }
+    }
+
+    // Write final VTK file
+    writeVTK(p, u, v, imin, imax, jmin, jmax, h, nSteps, t_final);
+
+    // Export residual history
+    writeResidualData(residual_history, "residuals.dat");
+
+    std::cout << "Done. Steps: " << nSteps << '\n';
+    
+    // Final statistics
+    auto [u_max_final, v_max_final, u_rms_final, v_rms_final] = computeVelocityStats();
+    int ic = imax/2, jc = jmax/2;
+    std::cout << "Final statistics:\n";
+    std::cout << "  Center velocities: u=" << 0.5*(u[jc][ic] + u[jc][ic-1]) 
+              << ", v=" << 0.5*(v[jc][ic] + v[jc-1][ic]) << std::endl;
+    std::cout << "  Max velocities: |u|_max=" << u_max_final << ", |v|_max=" << v_max_final << std::endl;
+    std::cout << "  RMS velocities: u_rms=" << u_rms_final << ", v_rms=" << v_rms_final << std::endl;
+    
+    return 0;
+}
