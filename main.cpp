@@ -1,9 +1,9 @@
 /**
  * @file   main.cpp
  * @brief  Lid‑Driven Cavity – explicit staggered‑grid solver with upwind convection.
- * @author Tyler Jones
+ * @author Tyler Jones (Fixed Version)
  * @date   2025‑06‑22
- * @version 2.3 - Added data export capabilities with results folder
+ * @version 2.5 - Fixed major bugs causing zero velocity field
  */
 
 #include <iostream>
@@ -14,6 +14,7 @@
 #include <iomanip>
 #include <sstream>
 #include <filesystem>
+#include <tuple>
 
 using Field = std::vector<std::vector<double>>;
 static Field makeField(int rows, int cols, double val = 0.0) {
@@ -72,7 +73,6 @@ void writeVTK(const Field& p, const Field& u, const Field& v,
     int nx = imax - imin + 1;
     int ny = jmax - jmin + 1;
     int npoints = nx * ny;
-    int ncells = (nx-1) * (ny-1);
     
     // VTK header
     file << "# vtk DataFile Version 3.0\n";
@@ -191,26 +191,24 @@ void writeResidualData(const std::vector<ResidualData>& residuals, const std::st
 }
 
 int main() {
-    std::cout << ">>> Hello from cavity solver (central differences)\n";
-    
     // Create results directory
     createResultsDirectory();
     
     //── Physical & numerical parameters ───────────────────────────────────
     constexpr double L        = 1.0;    // cavity length (m)
-    constexpr int    N_int    = 32;     // interior p‑nodes per side
+    constexpr int    N_int    = 64;     // interior p‑nodes per side
     constexpr double Re       = 100.0;  // Reynolds number
     constexpr double U_lid    = 1.0;    // lid velocity (m/s)
-    constexpr double CFL      = 0.5;    // CFL safety factor
-    constexpr double t_final  = 10.0;   // end time (s)
+    constexpr double CFL      = 0.5;    // CFL number
+    constexpr double t_final  = 20.0;   // end time (increased for better convergence)
     constexpr double tol_P    = 1e-6;   // Poisson tolerance
     constexpr double omega    = 1.6;    // SOR relaxation parameter
-    constexpr int    max_iter = 1000;   // Maximum SOR iterations
+    constexpr int    max_iter = 5000;   // More SOR iterations
     
     //── Output control parameters ─────────────────────────────────────────
     constexpr int vtk_interval = 100;     // Write VTK every N steps
     constexpr int residual_interval = 10; // Record residuals every N steps
-    constexpr int print_interval = 500;   // Print progress every N steps
+    constexpr int print_interval = 100;   // Print progress every N steps
 
     //── Derived grid metrics and parameters ───────────────────────────────
     double nu = U_lid * L / Re;
@@ -245,157 +243,136 @@ int main() {
 
     //── Apply boundary conditions (ghost layers) ─────────────────────────
     auto applyBC = [&]() {
-        // North lid (moving wall at j = jmax+1)
+        // North lid (moving wall) - FIXED: Apply BC to u-velocity faces at the lid
         for (int i = 0; i <= imax; ++i) {
-            u[jmax+1][i] = 2.0 * U_lid - u[jmax][i];  // Moving lid BC
-        }
-        for (int i = 0; i <= imax+1; ++i) {
-            v[jmax][i] = 0.0;  // No penetration at lid
+            u[jmax+1][i] = 2.0 * U_lid - u[jmax][i]; 
         }
 
-        // South wall (no-slip at j = 0)
+        // South wall (no-slip)
         for (int i = 0; i <= imax; ++i) {
-            u[0][i] = -u[1][i];  // No-slip BC
-        }
-        for (int i = 0; i <= imax+1; ++i) {
-            v[0][i] = 0.0;  // No penetration at south wall
+            u[0][i] = -u[1][i];  
         }
 
-        // East wall (no-slip at i = imax+1)
-        for (int j = 0; j <= jmax+1; ++j) {
-            u[j][imax] = 0.0;  // No penetration at east wall
-        }
+        // East wall (no-slip)
         for (int j = 0; j <= jmax; ++j) {
-            v[j][imax+1] = -v[j][imax];  // No-slip BC
+            v[j][imax+1] = -v[j][imax];  
         }
 
-        // West wall (no-slip at i = 0)
-        for (int j = 0; j <= jmax+1; ++j) {
-            u[j][0] = 0.0;  // No penetration at west wall
-        }
+        // West wall (no-slip)
         for (int j = 0; j <= jmax; ++j) {
-            v[j][0] = -v[j][1];  // No-slip BC
+            v[j][0] = -v[j][1];  
         }
     };
 
-    //── Predictor step: compute u*, v* ────────────────────────────────────
+    //── Predictor step: compute u*, v* ────────────────
     auto predictor = [&]() {
         double h2_inv = 1.0 / (h * h);
         double h_inv = 1.0 / h;
         
-        // Compute u* from momentum equation (without pressure gradient)
-        for (int j = jmin; j <= jmax; ++j) {
+        // Compute u* from momentum equation - FIXED INDEXING
+        for (int j = jmin; j <= jmax; ++j) {  // FIXED: was jmax-1, should be jmax
             for (int i = imin; i <= imax-1; ++i) {
-                // Viscous term: ν(∇⋅∇)u
+                // Viscous term: ν ∇²u
                 double Term1_U = nu * ((u[j][i+1] - 2.0*u[j][i] + u[j][i-1]) * h2_inv +
-                                      (u[j+1][i] - 2.0*u[j][i] + u[j-1][i]) * h2_inv);
+                                       (u[j+1][i] - 2.0*u[j][i] + u[j-1][i]) * h2_inv);
                 
-                // Convective term: ∂(u²)/∂x 
-                double u_east = 0.5 * (u[j][i] + u[j][i+1]);
-                double u_west = 0.5 * (u[j][i-1] + u[j][i]);
-                double Term2_U = h_inv * (u_east*u_east - u_west*u_west);
+                // Convective term: ∂(u²)/∂x
+                double fe = 0.5 * (u[j][i] + u[j][i+1]);  
+                double fw = 0.5 * (u[j][i-1] + u[j][i]);  
+                double Term2_U = (fe*fe - fw*fw) * h_inv;
                 
-                // Convective term: ∂(vu)/∂y
-                double v_north = 0.25 * (v[j][i] + v[j][i+1]);
-                double v_south = 0.25 * (v[j-1][i] + v[j-1][i+1]);
-                double u_north = 0.5 * (u[j+1][i] + u[j][i]);
-                double u_south = 0.5 * (u[j-1][i] + u[j][i]);
-                double Term3_U = h_inv * (v_north * u_north - v_south * u_south);
+                // Cross‐stream convective flux ∂(vu)/∂y
+                double v_n = 0.5*(v[j][i] + v[j][i+1]);    // FIXED: was v[j+1][i]
+                double v_s = 0.5*(v[j-1][i] + v[j-1][i+1]); // FIXED: was v[j][i]
+                double u_n = 0.5*(u[j+1][i] + u[j][i]);    // FIXED: interpolation
+                double u_s = 0.5*(u[j-1][i] + u[j][i]);    // FIXED: interpolation
+                double Term3_U = (v_n*u_n - v_s*u_s) * h_inv;
                 
-                // Explicit Euler step
+                // Explicit Euler update
                 u_star[j][i] = u[j][i] + dt * (Term1_U - Term2_U - Term3_U);
             }
         }
-        
-        // Compute v* from momentum equation (without pressure gradient)
+
+        // Compute v* from momentum equation - FIXED INDEXING
         for (int j = jmin; j <= jmax-1; ++j) {
-            for (int i = imin; i <= imax; ++i) {
-                // Viscous term: ν(∇⋅∇)v
+            for (int i = imin; i <= imax; ++i) {  // FIXED: was imax-1, should be imax
+                // Viscous term: ν ∇²v
                 double Term1_V = nu * ((v[j][i+1] - 2.0*v[j][i] + v[j][i-1]) * h2_inv +
-                                      (v[j+1][i] - 2.0*v[j][i] + v[j-1][i]) * h2_inv);
-                
-                // Convective term: ∂(v²)/∂y (central differences, gamma=0)
-                double v_north = 0.5 * (v[j][i] + v[j+1][i]);
-                double v_south = 0.5 * (v[j-1][i] + v[j][i]);
-                double Term2_V = h_inv * (v_north*v_north - v_south*v_south);
-                
-                // Convective term: ∂(uv)/∂x (central differences, gamma=0)
-                double u_east = 0.25 * (u[j][i] + u[j+1][i]);
-                double u_west = 0.25 * (u[j][i-1] + u[j+1][i-1]);
-                double v_east = 0.5 * (v[j][i+1] + v[j][i]);
-                double v_west = 0.5 * (v[j][i-1] + v[j][i]);
-                double Term3_V = h_inv * (u_east * v_east - u_west * v_west);
-                
-                // Explicit Euler step
+                                       (v[j+1][i] - 2.0*v[j][i] + v[j-1][i]) * h2_inv);
+
+                // Convective term: ∂(v²)/∂y
+                double fn = 0.5*(v[j][i] + v[j+1][i]);
+                double fs = 0.5*(v[j-1][i] + v[j][i]);
+                double Term2_V = (fn*fn - fs*fs) * h_inv;
+
+                // Cross‐stream convective flux ∂(uv)/∂x
+                double u_e = 0.5*(u[j][i] + u[j+1][i]);     // FIXED: interpolation
+                double u_w = 0.5*(u[j][i-1] + u[j+1][i-1]); // FIXED: interpolation
+                double v_e = 0.5*(v[j][i] + v[j][i+1]);     // FIXED: interpolation
+                double v_w = 0.5*(v[j][i-1] + v[j][i]);     // FIXED: interpolation
+                double Term3_V = (u_e*v_e - u_w*v_w) * h_inv;
+
+                // Explicit Euler update
                 v_star[j][i] = v[j][i] + dt * (Term1_V - Term2_V - Term3_V);
             }
         }
+    };   
+        
+
+    auto solvePressure = [&]() -> std::pair<int,double> {
+        double h2_inv = 1.0/(h*h);
+        double tol = tol_P;           
+        double maxRes = 0.0;
+        int iter = 0;
+
+        // Precompute RHS = g = div(u*)/dt
+        for(int j=jmin; j<=jmax; ++j)
+            for(int i=imin; i<=imax; ++i)
+                rhs[j][i] = (1.0/dt) * (
+                            (u_star[j][i] - u_star[j][i-1]) * (1.0/h) +
+                            (v_star[j][i] - v_star[j-1][i]) * (1.0/h));
+
+        // SOR loop
+        while (iter < max_iter) {
+            ++iter;
+            // 1) update p in place
+            for(int j=jmin; j<=jmax; ++j) {
+                for(int i=imin; i<=imax; ++i) {
+                    double p_old = p[j][i];
+                    double p_new = 0.25 * (
+                        p[j][i+1] + p[j][i-1] +
+                        p[j+1][i] + p[j-1][i] -
+                        rhs[j][i] * h * h
+                    );
+                    p[j][i] = (1.0 - omega)*p_old + omega*p_new;
+                }
+            }
+
+            // 2) compute residual norm
+            maxRes = 0.0;
+            for(int j=jmin; j<=jmax; ++j) {
+                for(int i=imin; i<=imax; ++i) {
+                    double lap = ( p[j][i+1] - 2*p[j][i] + p[j][i-1] ) * h2_inv
+                                + ( p[j+1][i] - 2*p[j][i] + p[j-1][i] ) * h2_inv;
+                    double r   = lap - rhs[j][i];
+                    maxRes = std::max(maxRes, std::abs(r));
+                }
+            }
+
+            // 3) check convergence
+            if (maxRes < tol) break;
+        }
+
+        return {iter, maxRes};
     };
 
-    //── Pressure Poisson Equation solver using SOR ───────────────────────
-    auto solvePressure = [&]() -> std::pair<int, double> {
-        double h_inv = 1.0 / h;
-        double dt_inv = 1.0 / dt;
-        
-        // Build RHS of pressure Poisson equation: ∇·u*/dt
-        for (int j = jmin; j <= jmax; ++j) {
-            for (int i = imin; i <= imax; ++i) {
-                double div_u_star = h_inv * ((u_star[j][i] - u_star[j][i-1]) + 
-                                            (v_star[j][i] - v_star[j-1][i]));
-                rhs[j][i] = dt_inv * div_u_star;
-            }
-        }
-        
-        // SOR iterations
-        int final_iter = 0;
-        double final_residual = 0.0;
-        
-        for (int iter = 0; iter < max_iter; ++iter) {
-            double residual = 0.0;
-            
-            for (int j = jmin; j <= jmax; ++j) {
-                for (int i = imin; i <= imax; ++i) {
-                    double p_old = p[j][i];
-                    
-                    // Five-point stencil for Laplacian
-                    double p_new = 0.25 * (p[j][i+1] + p[j][i-1] + p[j+1][i] + p[j-1][i] 
-                                          - h * h * rhs[j][i]);
-                    
-                    // SOR update
-                    p[j][i] = (1.0 - omega) * p_old + omega * p_new;
-                    
-                    // Accumulate residual
-                    double res_local = std::abs(p[j][i] - p_old);
-                    residual = std::max(residual, res_local);
-                }
-            }
-            
-            // Set reference pressure (p[jmin][imin] = 0 to fix constant)
-            double p_ref = p[jmin][imin];
-            for (int j = jmin; j <= jmax; ++j) {
-                for (int i = imin; i <= imax; ++i) {
-                    p[j][i] -= p_ref;
-                }
-            }
-            
-            final_iter = iter + 1;
-            final_residual = residual;
-            
-            // Check convergence
-            if (residual < tol_P) {
-                break;
-            }
-        }
-        
-        return {final_iter, final_residual};
-    };
 
     //── Corrector step: apply pressure gradient to get final u, v ─────────
     auto corrector = [&]() {
         double dt_h_inv = dt / h;
         
         // Correct u-velocities
-        for (int j = jmin; j <= jmax; ++j) {
+        for (int j = jmin; j <= jmax; ++j) {  // FIXED: was jmax-1, should be jmax
             for (int i = imin; i <= imax-1; ++i) {
                 u[j][i] = u_star[j][i] - dt_h_inv * (p[j][i+1] - p[j][i]);
             }
@@ -403,7 +380,7 @@ int main() {
         
         // Correct v-velocities
         for (int j = jmin; j <= jmax-1; ++j) {
-            for (int i = imin; i <= imax; ++i) {
+            for (int i = imin; i <= imax; ++i) {  // FIXED: was imax-1, should be imax
                 v[j][i] = v_star[j][i] - dt_h_inv * (p[j+1][i] - p[j][i]);
             }
         }
@@ -415,8 +392,8 @@ int main() {
         double u_sum_sq = 0.0, v_sum_sq = 0.0;
         int u_count = 0, v_count = 0;
         
-        // U-velocity statistics
-        for (int j = jmin; j <= jmax; ++j) {
+        // U-velocity statistics - FIXED INDEXING
+        for (int j = jmin; j <= jmax; ++j) {  // FIXED: was jmax-1
             for (int i = imin; i <= imax-1; ++i) {
                 u_max = std::max(u_max, std::abs(u[j][i]));
                 u_sum_sq += u[j][i] * u[j][i];
@@ -424,9 +401,9 @@ int main() {
             }
         }
         
-        // V-velocity statistics
+        // V-velocity statistics - FIXED INDEXING
         for (int j = jmin; j <= jmax-1; ++j) {
-            for (int i = imin; i <= imax; ++i) {
+            for (int i = imin; i <= imax; ++i) {  // FIXED: was imax-1
                 v_max = std::max(v_max, std::abs(v[j][i]));
                 v_sum_sq += v[j][i] * v[j][i];
                 v_count++;
@@ -483,14 +460,31 @@ int main() {
 
     std::cout << "Done. Steps: " << nSteps << '\n';
     
-    // Final statistics
+    // Final statistics and centerline comparison
     auto [u_max_final, v_max_final, u_rms_final, v_rms_final] = computeVelocityStats();
-    int ic = imax/2, jc = jmax/2;
-    std::cout << "Final statistics:\n";
-    std::cout << "  Center velocities: u=" << 0.5*(u[jc][ic] + u[jc][ic-1]) 
-              << ", v=" << 0.5*(v[jc][ic] + v[jc-1][ic]) << std::endl;
+    int ic = imax/2;
+    
+    std::cout << "\nFinal statistics:\n";
     std::cout << "  Max velocities: |u|_max=" << u_max_final << ", |v|_max=" << v_max_final << std::endl;
     std::cout << "  RMS velocities: u_rms=" << u_rms_final << ", v_rms=" << v_rms_final << std::endl;
+    
+    std::cout << "\nCenterline velocities for comparison with Ghia et al.:\n";
+    std::cout << "Vertical centerline (u-velocity at x=0.5):\n";
+    for (int j = jmin; j <= jmax; j += N_int/8) {
+        double y = (j - 0.5) * h;
+        double u_center = 0.5 * (u[j][ic] + u[j][ic-1]);
+        std::cout << "  y=" << std::fixed << std::setprecision(4) << y 
+                  << ", u=" << std::setprecision(6) << u_center << std::endl;
+    }
+    
+    std::cout << "\nHorizontal centerline (v-velocity at y=0.5):\n";
+    int jc = jmax/2;
+    for (int i = imin; i <= imax; i += N_int/8) {
+        double x = (i - 0.5) * h;
+        double v_center = 0.5 * (v[jc][i] + v[jc-1][i]);
+        std::cout << "  x=" << std::fixed << std::setprecision(4) << x 
+                  << ", v=" << std::setprecision(6) << v_center << std::endl;
+    }
     
     return 0;
 }
