@@ -191,28 +191,32 @@ void writeResidualData(const std::vector<ResidualData>& residuals, const std::st
 }
 
 int main() {
-    // Create results directory
     createResultsDirectory();
     
-    //── Physical & numerical parameters ───────────────────────────────────
+    // ---------------------------------
+    // Physical and Numerical Parameters
+    // ---------------------------------
     constexpr double L        = 1.0;    // cavity length (m)
-    constexpr int    N_int    = 64;     // interior p‑nodes per side
+    constexpr int    N_int    = 32;     // interior p‑nodes per side
     constexpr double Re       = 100.0;  // Reynolds number
     constexpr double U_lid    = 1.0;    // lid velocity (m/s)
     constexpr double CFL      = 0.5;    // CFL number
-    constexpr double t_final  = 20.0;   // end time (increased for better convergence)
+    constexpr double t_final  = 30.0;   // end time 
     constexpr double tol_P    = 1e-6;   // Poisson tolerance
-    constexpr double omega    = 1.6;    // SOR relaxation parameter
-    constexpr int    max_iter = 5000;   // More SOR iterations
+    constexpr int    max_iter = 5000;  // Maximum SOR iterations
     
-    //── Output control parameters ─────────────────────────────────────────
-    constexpr int vtk_interval = 100;     // Write VTK every N steps
-    constexpr int residual_interval = 10; // Record residuals every N steps
-    constexpr int print_interval = 100;   // Print progress every N steps
+    // -------------------------
+    // Output Control Parameters
+    // -------------------------
+    constexpr int vtk_interval = 100;      // Write VTK every N steps
+    constexpr int residual_interval = 100; // Record residuals every N steps
+    constexpr int print_interval = 100;    // Print progress every N steps
 
     //── Derived grid metrics and parameters ───────────────────────────────
     double nu = U_lid * L / Re;
     double h = L / N_int;
+    double rho_jacobi = 0.5 * (cos(3.1415 / (N_int + 1)) + cos(3.1415 / (N_int + 1)));
+    double omega = 2.0 / (1.0 + sqrt(1.0 - rho_jacobi * rho_jacobi));  // OPtimal SOR overrelaxation parameter
 
     int imin = 1;          // first interior index (x)
     int imax = N_int;      // last interior index (x)
@@ -221,13 +225,17 @@ int main() {
 
     double dt = CFL * std::min(0.25 * h * h / nu, h / U_lid);
     int nSteps = static_cast<int>(t_final / dt);
-
-    //── Data storage for history tracking ─────────────────────────────────
+    
+    // ---------------------------------
+    // Data storage for history tracking
+    // ---------------------------------
     std::vector<ResidualData> residual_history;
     residual_history.reserve(nSteps / residual_interval + 1);
 
-    //── Allocate fields ───────────────────────────────────────────────────
-    Field p = makeField(jmax + 2, imax + 2);  
+    // ---------------
+    // Allocate fields 
+    // ---------------
+    Field p = makeField(jmax + 2, imax + 2); 
     Field u = makeField(jmax + 2, imax + 1);  
     Field u_star = makeField(jmax + 2, imax + 1);
     Field v = makeField(jmax + 1, imax + 2);  
@@ -241,9 +249,11 @@ int main() {
         << "Output: VTK every " << vtk_interval << " steps, residuals every " 
         << residual_interval << " steps\n";
 
-    //── Apply boundary conditions (ghost layers) ─────────────────────────
+    // -------------------------------------
+    // Subroutine: Apply boundary conditions
+    // -------------------------------------
     auto applyBC = [&]() {
-        // North lid (moving wall) - FIXED: Apply BC to u-velocity faces at the lid
+        // North lid (moving wall)
         for (int i = 0; i <= imax; ++i) {
             u[jmax+1][i] = 2.0 * U_lid - u[jmax][i]; 
         }
@@ -264,15 +274,17 @@ int main() {
         }
     };
 
-    //── Predictor step: compute u*, v* ────────────────
+    // -----------------------------------------
+    // Subroutine: Predictor step compute u*, v*
+    // -----------------------------------------
     auto predictor = [&]() {
         double h2_inv = 1.0 / (h * h);
         double h_inv = 1.0 / h;
         
-        // Compute u* from momentum equation - FIXED INDEXING
-        for (int j = jmin; j <= jmax; ++j) {  // FIXED: was jmax-1, should be jmax
+        // Compute u* from momentum equation 
+        for (int j = jmin; j <= jmax; ++j) {  
             for (int i = imin; i <= imax-1; ++i) {
-                // Viscous term: ν ∇²u
+                // Viscous term: ν∇²u
                 double Term1_U = nu * ((u[j][i+1] - 2.0*u[j][i] + u[j][i-1]) * h2_inv +
                                        (u[j+1][i] - 2.0*u[j][i] + u[j-1][i]) * h2_inv);
                 
@@ -282,10 +294,10 @@ int main() {
                 double Term2_U = (fe*fe - fw*fw) * h_inv;
                 
                 // Cross‐stream convective flux ∂(vu)/∂y
-                double v_n = 0.5*(v[j][i] + v[j][i+1]);    // FIXED: was v[j+1][i]
-                double v_s = 0.5*(v[j-1][i] + v[j-1][i+1]); // FIXED: was v[j][i]
-                double u_n = 0.5*(u[j+1][i] + u[j][i]);    // FIXED: interpolation
-                double u_s = 0.5*(u[j-1][i] + u[j][i]);    // FIXED: interpolation
+                double v_n = 0.5*(v[j][i] + v[j][i+1]);    
+                double v_s = 0.5*(v[j-1][i] + v[j-1][i+1]); 
+                double u_n = 0.5*(u[j+1][i] + u[j][i]);    
+                double u_s = 0.5*(u[j-1][i] + u[j][i]);    
                 double Term3_U = (v_n*u_n - v_s*u_s) * h_inv;
                 
                 // Explicit Euler update
@@ -293,9 +305,9 @@ int main() {
             }
         }
 
-        // Compute v* from momentum equation - FIXED INDEXING
+        // Compute v* from momentum equation
         for (int j = jmin; j <= jmax-1; ++j) {
-            for (int i = imin; i <= imax; ++i) {  // FIXED: was imax-1, should be imax
+            for (int i = imin; i <= imax; ++i) {
                 // Viscous term: ν ∇²v
                 double Term1_V = nu * ((v[j][i+1] - 2.0*v[j][i] + v[j][i-1]) * h2_inv +
                                        (v[j+1][i] - 2.0*v[j][i] + v[j-1][i]) * h2_inv);
@@ -306,10 +318,10 @@ int main() {
                 double Term2_V = (fn*fn - fs*fs) * h_inv;
 
                 // Cross‐stream convective flux ∂(uv)/∂x
-                double u_e = 0.5*(u[j][i] + u[j+1][i]);     // FIXED: interpolation
-                double u_w = 0.5*(u[j][i-1] + u[j+1][i-1]); // FIXED: interpolation
-                double v_e = 0.5*(v[j][i] + v[j][i+1]);     // FIXED: interpolation
-                double v_w = 0.5*(v[j][i-1] + v[j][i]);     // FIXED: interpolation
+                double u_e = 0.5*(u[j][i] + u[j+1][i]);     
+                double u_w = 0.5*(u[j][i-1] + u[j+1][i-1]); 
+                double v_e = 0.5*(v[j][i] + v[j][i+1]);     
+                double v_w = 0.5*(v[j][i-1] + v[j][i]);     
                 double Term3_V = (u_e*v_e - u_w*v_w) * h_inv;
 
                 // Explicit Euler update
@@ -317,51 +329,80 @@ int main() {
             }
         }
     };   
-        
-
+      
+    // -------------------------------------------------------------------------
+    // Subroutine: Iteratively solve pressure-Poisson equation via SOR algorithm
+    // -------------------------------------------------------------------------
     auto solvePressure = [&]() -> std::pair<int,double> {
-        double h2_inv = 1.0/(h*h);
+        Field p_old = makeField(jmax + 2, imax + 2);
+        Field p_new = makeField(jmax + 2, imax + 2); 
+        double h1_inv = 1.0 / h;
+        double h2_inv = 1.0 / (h * h);
         double tol = tol_P;           
-        double maxRes = 0.0;
+        double maxRes = 1.0; // prevent short circuit
         int iter = 0;
 
-        // Precompute RHS = g = div(u*)/dt
+        // Zero initial guess
+        for (int j = 0; j <= jmax+1; ++j)
+            for (int i = 0; i <= imax+1; ++i)
+                p_old[j][i] = 0.0;
+
+        // Precompute source term: RHS = g = div(u*)/dt
         for(int j=jmin; j<=jmax; ++j)
             for(int i=imin; i<=imax; ++i)
                 rhs[j][i] = (1.0/dt) * (
-                            (u_star[j][i] - u_star[j][i-1]) * (1.0/h) +
-                            (v_star[j][i] - v_star[j-1][i]) * (1.0/h));
+                            (u_star[j][i] - u_star[j][i-1]) * h1_inv +
+                            (v_star[j][i] - v_star[j-1][i]) * h1_inv );
 
         // SOR loop
-        while (iter < max_iter) {
+        while (maxRes > tol && iter < max_iter) {
             ++iter;
-            // 1) update p in place
-            for(int j=jmin; j<=jmax; ++j) {
-                for(int i=imin; i<=imax; ++i) {
-                    double p_old = p[j][i];
-                    double p_new = 0.25 * (
-                        p[j][i+1] + p[j][i-1] +
-                        p[j+1][i] + p[j-1][i] -
-                        rhs[j][i] * h * h
-                    );
-                    p[j][i] = (1.0 - omega)*p_old + omega*p_new;
+            p_old.swap(p_new);
+
+            // SOR update into p_new
+            for (int j = jmin; j <= jmax; ++j) {
+                for (int i = imin; i <= imax; ++i) {
+                    int count = 0;
+                    double sum = 0.0;
+
+                    // West neighbor
+                    if (i > imin) { sum += p_new[j][i-1];  ++count; }
+                    // East neighbor
+                    if (i < imax) { sum += p_old[j][i+1];  ++count; }
+                    // South neighbor
+                    if (j > jmin) { sum += p_new[j-1][i];  ++count; }
+                    // North neighbor
+                    if (j < jmax) { sum += p_old[j+1][i];  ++count; }
+
+                    double p_guess = (sum - rhs[j][i] / h2_inv) / count;
+                    p_new[j][i] = (1.0 - omega)*p_old[j][i] + omega*p_guess;
                 }
             }
 
             // 2) compute residual norm
             maxRes = 0.0;
-            for(int j=jmin; j<=jmax; ++j) {
-                for(int i=imin; i<=imax; ++i) {
-                    double lap = ( p[j][i+1] - 2*p[j][i] + p[j][i-1] ) * h2_inv
-                                + ( p[j+1][i] - 2*p[j][i] + p[j-1][i] ) * h2_inv;
-                    double r   = lap - rhs[j][i];
+            for (int j = jmin; j <= jmax; ++j) {
+                for (int i = imin; i <= imax; ++i) {
+                    double lap = 0.0;
+                    int count = 0;
+                    if (i > imin) { lap += (p_new[j][i-1] - p_new[j][i]) * h2_inv; ++count; }
+                    if (i < imax) { lap += (p_new[j][i+1] - p_new[j][i]) * h2_inv; ++count; }
+                    if (j > jmin) { lap += (p_new[j-1][i] - p_new[j][i]) * h2_inv; ++count; }
+                    if (j < jmax) { lap += (p_new[j+1][i] - p_new[j][i]) * h2_inv; ++count; }
+
+                    double r = lap - rhs[j][i];
                     maxRes = std::max(maxRes, std::abs(r));
                 }
             }
 
-            // 3) check convergence
+            // check convergence
             if (maxRes < tol) break;
         }
+
+        // Update pressure
+        for (int j = jmin; j <= jmax; ++j)
+            for (int i = imin; i <= imax; ++i)
+                p[j][i] = p_new[j][i];
 
         return {iter, maxRes};
     };
@@ -425,10 +466,13 @@ int main() {
     for (int n = 0; n < nSteps; ++n) {
         double current_time = n * dt;
         
-        applyBC();
-        predictor();
-        auto [ppe_iter, ppe_res] = solvePressure();
-        corrector();
+        applyBC(); // apply BCs to ghost nodes on N,E,S,W boundaries
+
+        predictor(); // predict tentative velocities
+
+        auto [ppe_iter, ppe_res] = solvePressure(); // Iteratively solve PPE with SOR algorithm
+
+        corrector(); // Correct velocity field with computed pressure field
 
         // Record residual data
         if (n % residual_interval == 0) {
