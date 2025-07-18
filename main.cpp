@@ -1,10 +1,18 @@
 /**
  * @file    main.cpp
- * @brief   Lid‑Driven Cavity – explicit staggered‑grid solver
- * @author  Tyler Jones
- * @date    2025‑07‑11
- * @version 2.5 - Fixed major bugs causing zero velocity field
+ * @brief   Fully-explicit, staggered-grid lid-driven cavity solver.
+ *
+ * @details
+ *  • Time scheme:    Forward Euler  
+ *  • Diffusion:      2nd-order central  
+ *  • Convection:     1st-order central  
+ *  • Pressure solver: SOR  
+ *
+ * @author Tyler Jones
+ * @date   2025-07-11
+ * @version 3.0
  */
+
 
 #include <iostream>
 #include <vector>
@@ -171,6 +179,7 @@ void writeVTK(const Field& p, const Field& u, const Field& v,
             file << std::fixed << std::setprecision(6) << vorticity << "\n";
         }
     }
+
     
     file << "SCALARS boundary_id float 1\n";
     file << "LOOKUP_TABLE default\n";
@@ -231,13 +240,14 @@ int main() {
     // ---------------------------------
     // Physical and Numerical Parameters
     // ---------------------------------
-    constexpr double L        = 1.0;    // cavity length (m)
+    constexpr double L        = 1.0;    // cavity length
+    constexpr double H        = 1.0;    // cavity height
     constexpr int    N_int    = 32;     // interior p‑nodes per side
     constexpr double Re       = 100.0;  // Reynolds number
-    constexpr double U_lid    = 1.0;    // lid velocity (m/s)
+    constexpr double U_lid    = 1.0;    // lid velocity
     constexpr double CFL      = 0.5;    // CFL number
-    constexpr double t_final  = 20.0;   // end time 
-    constexpr double tol_P    = 1e-7;   // Poisson tolerance
+    constexpr double t_final  = 20.0;   // Final time of simulation
+    constexpr double tolfac   = 1e-7;   // Poisson tolerance
     constexpr int    max_iter = 10000;  // Maximum SOR iterations
     
     // -------------------------
@@ -245,23 +255,24 @@ int main() {
     // -------------------------
     constexpr int vtk_interval      = 100;   // Write VTK every N steps
     constexpr int residual_interval = 100;   // Record residuals every N steps
-    constexpr int print_interval    = 1000;   // Print progress every N steps
+    constexpr int print_interval    = 100;   // Print progress every N steps
 
     // -----------------------------------
     // Derived grid metrics and parameters
     // -----------------------------------
-    double nu     = U_lid * L / Re;   // Kinematic viscosity
-    double h      = L / N_int;        // Spatial step length (dx and dy)
+    double nu = U_lid * L / Re;   // Kinematic viscosity
+    double h  = L / N_int;        // Spatial step length (dx and dy)
 
     // Optimal SOR overrelaxation parameter
-    double rho_jacobi = 0.5 * (cos(3.1415 / (N_int + 1)) + cos(3.1415 / (N_int + 1)));
-    double omega      = 2.0 / (1.0 + sqrt(1.0 - rho_jacobi * rho_jacobi)); 
+    constexpr double PI = 3.14159265358979323846;
+    double rho_jacobi   = cos(PI / (N_int + 1));
+    double omega        = 2.0 / (1.0 + sqrt(1.0 - rho_jacobi * rho_jacobi));
 
-    // Index helpers
+    // Indexing helpers
     int imin = 1;          // first interior index (x)
-    int imax = N_int;      // last interior index (x)
+    int imax = L * N_int;      // last interior index (x)
     int jmin = 1;          // first interior index (y)
-    int jmax = N_int;      // last interior index (y)
+    int jmax = H * N_int;      // last interior index (y)
 
     double dt  = CFL * std::min(0.25 * h * h / nu, h / U_lid);   // Time step
     int nSteps = static_cast<int>(t_final / dt);                 // Number of time steps
@@ -281,6 +292,7 @@ int main() {
     Field v_star = makeField(jmax + 1, imax + 2);   // Tentative v-velocity field
     Field v      = makeField(jmax + 1, imax + 2);   // Corrected v-velocity field
     Field rhs    = makeField(jmax + 2, imax + 2);   // Right-hand side of PPE (source term)
+    Field ppe_res = makeField(jmax + 2, imax + 2);  // local PPE residual
     
     std::cout 
         << "Grid: " << N_int << "×" << N_int << " (h=" << h << ")\n"
@@ -319,7 +331,7 @@ int main() {
     // -----------------------------------------
     auto predictor = [&]() {
         double h2_inv = 1.0 / (h * h);
-        double h_inv = 1.0 / h;
+        double h_inv  = 1.0 / h;
         
         // Compute u* from momentum equation (neglect pressure gradient)
         for (int j = jmin; j <= jmax; ++j) {  
@@ -375,8 +387,8 @@ int main() {
     // -------------------------------------------------------------
     auto solvePressure = [&]() -> std::pair<int,double> {
         Field p_old   = makeField(jmax + 2, imax + 2);   // Last pressure field
-        Field p_new   = makeField(jmax + 2, imax + 2);   // Next pressure field
-        double tol    = tol_P;                           // Residual tolerance  
+        Field p_new   = makeField(jmax + 2, imax + 2);   // Next pressure field  
+        double max_rhs = 0.0;
         double maxRes = 1.0;                             // prevent short circuit
         int iter      = 0;                               // Initialize PPE iterations
         double h1_inv = 1.0 / h;
@@ -389,6 +401,14 @@ int main() {
                             (u_star[j][i] - u_star[j][i-1]) * h1_inv +
                             (v_star[j][i] - v_star[j-1][i]) * h1_inv );
 
+        // Compute tolerance
+        for (int j = jmin; j <= jmax; ++j) {
+            for (int i = imin; i <= imax; ++i) {
+                max_rhs = std::max(max_rhs, std::abs(rhs[j][i]));
+            }
+        }
+        double tol = tolfac * max_rhs;
+
         // SOR loop
         while (maxRes > tol && iter < max_iter) {
             ++iter;
@@ -400,14 +420,10 @@ int main() {
                     int count  = 0;
                     double sum = 0.0;
 
-                    // West neighbor
-                    if (i > imin) { sum += p_new[j][i-1];  ++count; }
-                    // East neighbor
-                    if (i < imax) { sum += p_old[j][i+1];  ++count; }
-                    // South neighbor
-                    if (j > jmin) { sum += p_new[j-1][i];  ++count; }
-                    // North neighbor
-                    if (j < jmax) { sum += p_old[j+1][i];  ++count; }
+                    if (i > imin) { sum += p_new[j][i-1];  ++count; } // West neighbor
+                    if (i < imax) { sum += p_old[j][i+1];  ++count; } // East neighbor
+                    if (j > jmin) { sum += p_new[j-1][i];  ++count; } // South neighbor
+                    if (j < jmax) { sum += p_old[j+1][i];  ++count; } // North neighbor
 
                     double p_guess = (sum - rhs[j][i] / h2_inv) / count;         // Gauss–Seidel/Jacobi estimate
                     p_new[j][i]    = (1.0 - omega)*p_old[j][i] + omega*p_guess;  // SOR upadte
@@ -428,6 +444,7 @@ int main() {
                     if (j < jmax) { lap += (p_new[j+1][i] - p_new[j][i]) * h2_inv; ++count; }
 
                     double r = lap - rhs[j][i];                 // Local defect
+                    ppe_res[j][i] = r;
                     maxRes   = std::max(maxRes, std::abs(r));   // Inf norm
                 }
             }
@@ -438,6 +455,7 @@ int main() {
 
         // Update pressure
         p = p_new;
+        // std::cout << "SOR iter " << iter << "  max residual = " << maxRes << "\n";
 
         return {iter, maxRes};
     };
@@ -499,8 +517,7 @@ int main() {
     // ------------------
     // Time marching loop
     // ------------------
-    std::cout << ">> Entering time loop\n";
-    writeVTK(p, u, v, imin, imax, jmin, jmax, h, 0, 0.0);
+    writeVTK(p, u, v, imin, imax, jmin, jmax, h, 0, 0.0); // Write initial data
     
     for (int n = 0; n < nSteps; ++n) {
         double current_time = n * dt;
