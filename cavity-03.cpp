@@ -10,7 +10,7 @@
  *
  * @author Tyler Jones
  * @date   2025-07-28
- * @version 4.0
+ * @version 3.0
  */
 
 #include <iostream>
@@ -76,16 +76,17 @@ using VelocityFields = std::pair<Field, Field>;
 class CavitySolver {
 private:
     // Physical and numerical parameters
-    static constexpr double cavity_length = 1.0;
-    static constexpr double cavity_height = 1.0;
-    static constexpr int n_interior = 32;
-    static constexpr double reynolds_number = 100.0;
-    static constexpr double lid_velocity = 1.0;
-    static constexpr double cfl_number = 0.5;
-    static constexpr double final_time = 20.0;
+    static constexpr double cavity_length    = 1.0;
+    static constexpr double cavity_height    = 1.0;
+    static constexpr int n_interior          = 32;
+    static constexpr double reynolds_number  = 100.0;
+    static constexpr double lid_velocity     = 1.0;
+    static constexpr double density          = 1.0;
+    static constexpr double cfl_number       = 0.5;
+    static constexpr double final_time       = 20.0;
     static constexpr double tolerance_factor = 1e-7;
-    static constexpr int max_sor_iterations = 10000;
-    static constexpr int print_interval = 100;
+    static constexpr int max_sor_iterations  = 10000;
+    static constexpr int print_interval      = 100;
 
     // Derived parameters
     const double kinematic_viscosity;
@@ -94,29 +95,29 @@ private:
     const double time_step;
     const int total_time_steps;
     
-    // Grid indexing
-    const int i_min = 1;
-    const int i_max;
-    const int j_min = 1; 
-    const int j_max;
+    // Grid indexing helpers
+    const int i_min = 1;   // First interior i index for cell center
+    const int i_max;       // Last interior i index for cell center
+    const int j_min = 1;   // First interior j index for cell center
+    const int j_max;       // Last interior j index for cell center
 
     // Flow fields
     Field pressure;
-    Field pressure_rhs;
-    Field pressure_residual;
+    Field source_term;
+    Field poisson_residual;
     Field u_tentative;
-    Field u_velocity;
-    Field u_cell_center;
+    Field u_corrected;
+    Field u_center;
     Field v_tentative;
-    Field v_velocity;
-    Field v_cell_center;
+    Field v_corrected;
+    Field v_center;
 
 public:
     /**
      * @brief Constructor - initializes solver parameters and allocates memory
      */
     CavitySolver() 
-        : kinematic_viscosity(lid_velocity * cavity_length / reynolds_number)
+        : kinematic_viscosity(density * lid_velocity * cavity_length / reynolds_number)
         , grid_spacing(cavity_length / n_interior)
         , optimal_omega(compute_optimal_omega(n_interior))
         , time_step(cfl_number * std::min(0.25 * grid_spacing * grid_spacing / kinematic_viscosity, 
@@ -138,16 +139,16 @@ public:
                   <<"Starting simulation...\n"
                   << RESET;
         
-        for (int time_step_idx = 0; time_step_idx < total_time_steps; ++time_step_idx) {
+        for (int time_step_idx = 1; time_step_idx <= total_time_steps; ++time_step_idx) {
             const auto current_time = time_step_idx * time_step;
             
             apply_boundary_conditions();
-            predictor_step();
+            computeTentativeVelocities();
             const auto [sor_iterations, residual] = solve_pressure_poisson();
-            corrector_step();
+            applyPressureCorrection();
 
-            if (time_step_idx % print_interval == 0) {
-                print_statistics(time_step_idx, current_time, sor_iterations);
+            if (time_step_idx % print_interval == 0 || time_step_idx == total_time_steps) {
+                log_statistics(time_step_idx, current_time, sor_iterations);
             }
         }
         
@@ -161,13 +162,13 @@ private:
      * @brief Validate input parameters for physical consistency
      */
     void validate_parameters() const {
-        static_assert(n_interior > 0, "Grid size must be positive");
-        static_assert(reynolds_number > 0, "Reynolds number must be positive");
-        static_assert(cfl_number > 0 && cfl_number < 1, "CFL number must be between 0 and 1");
-        static_assert(final_time > 0, "Simulation time must be positive");
+        static_assert(n_interior > 0, "Grid size must be positive!");
+        static_assert(reynolds_number > 0, "Reynolds number must be positive!");
+        static_assert(cfl_number > 0 && cfl_number < 1, "CFL number must be between 0 and 1!");
+        static_assert(final_time > 0, "Simulation time must be positive!");
         
         if (time_step <= 0) {
-            throw std::runtime_error("Computed time step is non-positive");
+            throw std::runtime_error("Computed time step is non-positive. Check physical parameters!");
         }
     }
 
@@ -176,15 +177,15 @@ private:
      */
     void allocate_fields() {
         try {
-            pressure = create_field(j_max + 2, i_max + 2);
-            pressure_rhs = create_field(j_max + 2, i_max + 2);
-            pressure_residual = create_field(j_max + 2, i_max + 2);
-            u_tentative = create_field(j_max + 2, i_max + 1);
-            u_velocity = create_field(j_max + 2, i_max + 1);
-            u_cell_center = create_field(j_max + 2, i_max + 2);
-            v_tentative = create_field(j_max + 1, i_max + 2);
-            v_velocity = create_field(j_max + 1, i_max + 2);
-            v_cell_center = create_field(j_max + 2, i_max + 2);
+            pressure          = create_field(j_max + 2, i_max + 2);
+            source_term       = create_field(j_max + 2, i_max + 2);
+            poisson_residual  = create_field(j_max + 2, i_max + 2);
+            u_tentative       = create_field(j_max + 2, i_max + 1);
+            u_corrected       = create_field(j_max + 2, i_max + 1);
+            u_center          = create_field(j_max + 2, i_max + 2);
+            v_tentative       = create_field(j_max + 1, i_max + 2);
+            v_corrected       = create_field(j_max + 1, i_max + 2);
+            v_center          = create_field(j_max + 2, i_max + 2);
         } catch (const std::exception& e) {
             throw std::runtime_error("Failed to allocate memory for flow fields: " + std::string(e.what()));
         }
@@ -195,50 +196,51 @@ private:
      */
     void print_simulation_info() const {
         std::cout << std::fixed << std::setprecision(6);
-        std::cout << BLUE
+        std::cout << CYAN
                   << "=== Lid-Driven Cavity Flow Simulation ===\n"
-                  << "Grid: " << n_interior << "×" << n_interior 
+                  << "Domain: " << cavity_length << "x" << cavity_height << "\n"
+                  << "Grid: " << n_interior << "x" << n_interior 
                   << " (spacing=" << grid_spacing << ")\n"
                   << "Time: dt=" << time_step 
                   << ", steps=" << total_time_steps 
                   << ", final_time=" << final_time << "\n"
                   << "Reynolds=" << reynolds_number 
-                  << ", viscosity=" << kinematic_viscosity 
+                  << ", kinematic viscosity=" << kinematic_viscosity 
                   << ", CFL=" << cfl_number << "\n"
-                  << "SOR omega=" << optimal_omega << "\n"
+                  << "Relaxation factor=" << optimal_omega << "\n"
                   << "==========================================\n"
                   << RESET << "\n";
     }
 
     /**
-     * @brief Apply boundary conditions using ghost cell approach
+     * @brief Apply Nuemann boundary conditions using ghost cell method
      */
     void apply_boundary_conditions() noexcept {
         // North lid (moving wall) - u velocity
         for (int i = 0; i <= i_max; ++i) {
-            u_velocity[j_max + 1][i] = 2.0 * lid_velocity - u_velocity[j_max][i];
+            u_corrected[j_max + 1][i] = 2.0 * lid_velocity - u_corrected[j_max][i];
         }
 
         // South wall (no-slip) - u velocity  
         for (int i = 0; i <= i_max; ++i) {
-            u_velocity[0][i] = -u_velocity[1][i];
+            u_corrected[0][i] = -u_corrected[1][i];
         }
 
         // East wall (no-slip) - v velocity
         for (int j = 0; j <= j_max; ++j) {
-            v_velocity[j][i_max + 1] = -v_velocity[j][i_max];
+            v_corrected[j][i_max + 1] = -v_corrected[j][i_max];
         }
 
         // West wall (no-slip) - v velocity
         for (int j = 0; j <= j_max; ++j) {
-            v_velocity[j][0] = -v_velocity[j][1];
+            v_corrected[j][0] = -v_corrected[j][1];
         }
     }
 
     /**
      * @brief Predictor step: compute tentative velocities without pressure gradient
      */
-    void predictor_step() noexcept {
+    void computeTentativeVelocities() noexcept {
         const auto grid_spacing_inv = 1.0 / grid_spacing;
         const auto grid_spacing_sq_inv = 1.0 / (grid_spacing * grid_spacing);
         
@@ -246,25 +248,25 @@ private:
         for (int j = j_min; j <= j_max; ++j) {
             for (int i = i_min; i <= i_max - 1; ++i) {
                 // Viscous diffusion: ν∇²u
-                const auto viscous_term = kinematic_viscosity * (
-                    (u_velocity[j][i+1] - 2.0*u_velocity[j][i] + u_velocity[j][i-1]) * grid_spacing_sq_inv +
-                    (u_velocity[j+1][i] - 2.0*u_velocity[j][i] + u_velocity[j-1][i]) * grid_spacing_sq_inv
+                const auto diffusion_term = kinematic_viscosity * (
+                    (u_corrected[j][i+1] - 2.0*u_corrected[j][i] + u_corrected[j][i-1]) * grid_spacing_sq_inv +
+                    (u_corrected[j+1][i] - 2.0*u_corrected[j][i] + u_corrected[j-1][i]) * grid_spacing_sq_inv
                 );
                 
                 // Convective flux: ∂(u²)/∂x
-                const auto u_east = 0.5 * (u_velocity[j][i] + u_velocity[j][i+1]);
-                const auto u_west = 0.5 * (u_velocity[j][i-1] + u_velocity[j][i]);
+                const auto u_east       = 0.5 * (u_corrected[j][i]   + u_corrected[j][i+1]);
+                const auto u_west       = 0.5 * (u_corrected[j][i-1] + u_corrected[j][i]);
                 const auto convection_x = (u_east*u_east - u_west*u_west) * grid_spacing_inv;
                 
                 // Cross-stream convective flux: ∂(vu)/∂y
-                const auto v_north = 0.5 * (v_velocity[j][i] + v_velocity[j][i+1]);
-                const auto v_south = 0.5 * (v_velocity[j-1][i] + v_velocity[j-1][i+1]);
-                const auto u_north = 0.5 * (u_velocity[j+1][i] + u_velocity[j][i]);
-                const auto u_south = 0.5 * (u_velocity[j-1][i] + u_velocity[j][i]);
+                const auto v_north      = 0.5 * (v_corrected[j][i]   + v_corrected[j][i+1]);
+                const auto v_south      = 0.5 * (v_corrected[j-1][i] + v_corrected[j-1][i+1]);
+                const auto u_north      = 0.5 * (u_corrected[j+1][i] + u_corrected[j][i]);
+                const auto u_south      = 0.5 * (u_corrected[j-1][i] + u_corrected[j][i]);
                 const auto convection_y = (v_north*u_north - v_south*u_south) * grid_spacing_inv;
                 
                 // Forward Euler update
-                u_tentative[j][i] = u_velocity[j][i] + time_step * (viscous_term - convection_x - convection_y);
+                u_tentative[j][i] = u_corrected[j][i] + time_step * (diffusion_term - convection_x - convection_y);
             }
         }
 
@@ -272,25 +274,25 @@ private:
         for (int j = j_min; j <= j_max - 1; ++j) {
             for (int i = i_min; i <= i_max; ++i) {
                 // Viscous diffusion: ν∇²v
-                const auto viscous_term = kinematic_viscosity * (
-                    (v_velocity[j][i+1] - 2.0*v_velocity[j][i] + v_velocity[j][i-1]) * grid_spacing_sq_inv +
-                    (v_velocity[j+1][i] - 2.0*v_velocity[j][i] + v_velocity[j-1][i]) * grid_spacing_sq_inv
+                const auto diffusion_term = kinematic_viscosity * (
+                    (v_corrected[j][i+1] - 2.0*v_corrected[j][i] + v_corrected[j][i-1]) * grid_spacing_sq_inv +
+                    (v_corrected[j+1][i] - 2.0*v_corrected[j][i] + v_corrected[j-1][i]) * grid_spacing_sq_inv
                 );
 
                 // Convective flux: ∂(v²)/∂y
-                const auto v_north = 0.5 * (v_velocity[j][i] + v_velocity[j+1][i]);
-                const auto v_south = 0.5 * (v_velocity[j-1][i] + v_velocity[j][i]);
+                const auto v_north      = 0.5 * (v_corrected[j][i]   + v_corrected[j+1][i]);
+                const auto v_south      = 0.5 * (v_corrected[j-1][i] + v_corrected[j][i]);
                 const auto convection_y = (v_north*v_north - v_south*v_south) * grid_spacing_inv;
 
                 // Cross-stream convective flux: ∂(uv)/∂x
-                const auto u_east = 0.5 * (u_velocity[j][i] + u_velocity[j+1][i]);
-                const auto u_west = 0.5 * (u_velocity[j][i-1] + u_velocity[j+1][i-1]);
-                const auto v_east = 0.5 * (v_velocity[j][i] + v_velocity[j][i+1]);
-                const auto v_west = 0.5 * (v_velocity[j][i-1] + v_velocity[j][i]);
+                const auto u_east       = 0.5 * (u_corrected[j][i]   + u_corrected[j+1][i]);
+                const auto u_west       = 0.5 * (u_corrected[j][i-1] + u_corrected[j+1][i-1]);
+                const auto v_east       = 0.5 * (v_corrected[j][i]   + v_corrected[j][i+1]);
+                const auto v_west       = 0.5 * (v_corrected[j][i-1] + v_corrected[j][i]);
                 const auto convection_x = (u_east*v_east - u_west*v_west) * grid_spacing_inv;
 
                 // Forward Euler update
-                v_tentative[j][i] = v_velocity[j][i] + time_step * (viscous_term - convection_y - convection_x);
+                v_tentative[j][i] = v_corrected[j][i] + time_step * (diffusion_term - convection_y - convection_x);
             }
         }
     }
@@ -307,64 +309,65 @@ private:
         const auto grid_spacing_sq_inv = 1.0 / (grid_spacing * grid_spacing);
         const auto time_step_inv = 1.0 / time_step;
         
-        auto max_rhs = 0.0;
-        auto max_residual = 1.0;  // Initialize > 0 to enter loop
+        auto max_source_term = 0.0;
+        auto max_poisson_residual = 1.0;  // Initialize > 0 to enter loop
         auto iteration_count = 0;
 
-        // Compute source term: RHS = ∇·u*/dt
+        // Compute source term
         for (int j = j_min; j <= j_max; ++j) {
             for (int i = i_min; i <= i_max; ++i) {
-                pressure_rhs[j][i] = time_step_inv * (
+                source_term[j][i] = time_step_inv * density * (
                     (u_tentative[j][i] - u_tentative[j][i-1]) * grid_spacing_inv +
                     (v_tentative[j][i] - v_tentative[j-1][i]) * grid_spacing_inv
                 );
-                max_rhs = std::max(max_rhs, std::abs(pressure_rhs[j][i]));
+                max_source_term = std::max(max_source_term, std::abs(source_term[j][i]));
             }
         }
 
-        const auto tolerance = tolerance_factor * max_rhs;
+        const auto tolerance = tolerance_factor * max_source_term;
 
         // SOR iteration loop
-        while (max_residual > tolerance && iteration_count < max_sor_iterations) {
+        while ((max_poisson_residual > tolerance) && (iteration_count < max_sor_iterations)) {
             ++iteration_count;
             pressure_old.swap(pressure_new);
 
             // SOR update sweep
             for (int j = j_min; j <= j_max; ++j) {
                 for (int i = i_min; i <= i_max; ++i) {
-                    auto neighbor_count = 0;
-                    auto neighbor_sum = 0.0;
 
-                    // Collect neighboring pressure values
-                    if (i > i_min) { neighbor_sum += pressure_new[j][i-1]; ++neighbor_count; }
-                    if (i < i_max) { neighbor_sum += pressure_old[j][i+1]; ++neighbor_count; }
-                    if (j > j_min) { neighbor_sum += pressure_new[j-1][i]; ++neighbor_count; }
-                    if (j < j_max) { neighbor_sum += pressure_old[j+1][i]; ++neighbor_count; }
-
-                    // Gauss-Seidel estimate
-                    const auto pressure_estimate = (neighbor_sum - pressure_rhs[j][i] / grid_spacing_sq_inv) / neighbor_count;
+                    // Indicator functions
+                    int eps_w = (i > i_min) ? 1 : 0;   // West neighbor
+                    int eps_e = (i < i_max) ? 1 : 0;   // East neighbor  
+                    int eps_n = (j < j_max) ? 1 : 0;   // North neighbor
+                    int eps_s = j_min;                 // South neighbor (always true)
+                    int neighbor_count = eps_w + eps_e + eps_n + eps_s;
                     
                     // SOR update
-                    pressure_new[j][i] = (1.0 - optimal_omega) * pressure_old[j][i] + optimal_omega * pressure_estimate;
+                    pressure_new[j][i] = pressure_old[j][i] * (1.0 - optimal_omega) + (optimal_omega / neighbor_count) * (
+                        (eps_e*pressure_old[j][i+1] + eps_w*pressure_new[j][i-1]) + 
+                        (eps_n*pressure_old[j+1][i] + eps_s*pressure_new[j-1][i]) - source_term[j][i] * (grid_spacing * grid_spacing)
+                    );
                 }
             }
 
             // Compute residual norm every iteration
-            max_residual = 0.0;
+            max_poisson_residual = 0.0;
             for (int j = j_min; j <= j_max; ++j) {
                 for (int i = i_min; i <= i_max; ++i) {
-                    auto laplacian = 0.0;
-                    auto neighbor_count = 0;
 
-                    // Compute discrete Laplacian
-                    if (i > i_min) { laplacian += (pressure_new[j][i-1] - pressure_new[j][i]) * grid_spacing_sq_inv; ++neighbor_count; }
-                    if (i < i_max) { laplacian += (pressure_new[j][i+1] - pressure_new[j][i]) * grid_spacing_sq_inv; ++neighbor_count; }
-                    if (j > j_min) { laplacian += (pressure_new[j-1][i] - pressure_new[j][i]) * grid_spacing_sq_inv; ++neighbor_count; }
-                    if (j < j_max) { laplacian += (pressure_new[j+1][i] - pressure_new[j][i]) * grid_spacing_sq_inv; ++neighbor_count; }
+                    // Indicator functions
+                    int eps_w = (i > i_min) ? 1 : 0;   // West neighbor
+                    int eps_e = (i < i_max) ? 1 : 0;   // East neighbor  
+                    int eps_n = (j < j_max) ? 1 : 0;   // North neighbor
+                    int eps_s = j_min;                 // South neighbor (always true)
 
-                    const auto local_residual = laplacian - pressure_rhs[j][i];
-                    pressure_residual[j][i] = local_residual;
-                    max_residual = std::max(max_residual, std::abs(local_residual));
+                    // Compute residual
+                    poisson_residual[j][i] = grid_spacing_sq_inv * (
+                        eps_e*(pressure_new[j][i+1] - pressure_new[j][i]) + eps_w*(pressure_new[j][i-1] - pressure_new[j][i]) + 
+                        eps_n*(pressure_new[j+1][i] - pressure_new[j][i]) + eps_s*(pressure_new[j-1][i] - pressure_new[j][i])
+                    ) - source_term[j][i];
+
+                    max_poisson_residual = std::max(max_poisson_residual, std::abs(poisson_residual[j][i]));
                 }
             }
         }
@@ -372,32 +375,32 @@ private:
         // Check for convergence issues
         if (iteration_count >= max_sor_iterations) {
             std::cerr << "Warning: SOR solver did not converge in " << max_sor_iterations 
-                      << " iterations. Final residual: " << max_residual << "\n";
+                      << " iterations. Final residual: " << max_poisson_residual << "\n";
         }
 
         // Update global pressure field
         pressure = std::move(pressure_new);
 
-        return {iteration_count, max_residual};
+        return {iteration_count, max_poisson_residual};
     }
 
     /**
      * @brief Corrector step: apply pressure gradient to get final velocities
      */
-    void corrector_step() noexcept {
+    void applyPressureCorrection() noexcept {
         const auto dt_over_h = time_step / grid_spacing;
         
         // Correct u-velocities
         for (int j = j_min; j <= j_max; ++j) {
             for (int i = i_min; i <= i_max - 1; ++i) {
-                u_velocity[j][i] = u_tentative[j][i] - dt_over_h * (pressure[j][i+1] - pressure[j][i]);
+                u_corrected[j][i] = u_tentative[j][i] - dt_over_h * density * (pressure[j][i+1] - pressure[j][i]);
             }
         }
         
         // Correct v-velocities  
         for (int j = j_min; j <= j_max - 1; ++j) {
             for (int i = i_min; i <= i_max; ++i) {
-                v_velocity[j][i] = v_tentative[j][i] - dt_over_h * (pressure[j+1][i] - pressure[j][i]);
+                v_corrected[j][i] = v_tentative[j][i] - dt_over_h * density * (pressure[j+1][i] - pressure[j][i]);
             }
         }
     }
@@ -410,18 +413,18 @@ private:
         // Interpolate u-velocity to cell centers
         for (int j = j_min; j <= j_max; ++j) {
             for (int i = i_min; i <= i_max; ++i) {
-                u_cell_center[j][i] = 0.5 * (u_velocity[j][i-1] + u_velocity[j][i]);
+                u_center[j][i] = 0.5 * (u_corrected[j][i-1] + u_corrected[j][i]);
             }
         }
         
         // Interpolate v-velocity to cell centers
         for (int j = j_min; j <= j_max; ++j) {
             for (int i = i_min; i <= i_max; ++i) {
-                v_cell_center[j][i] = 0.5 * (v_velocity[j-1][i] + v_velocity[j][i]);
+                v_center[j][i] = 0.5 * (v_corrected[j-1][i] + v_corrected[j][i]);
             }
         }
         
-        return {u_cell_center, v_cell_center};
+        return {u_center, v_center};
     }
 
     /**
@@ -430,7 +433,7 @@ private:
      * @param current_time Current simulation time
      * @param sor_iterations Number of SOR iterations used
      */
-    void print_statistics(int step_number, double current_time, int sor_iterations) {
+    void log_statistics(int step_number, double current_time, int sor_iterations) {
         const auto [u_center, v_center] = interpolate_to_cell_centers();
         
         auto max_u_velocity = 0.0;
@@ -456,14 +459,13 @@ private:
         // Divergence check using staggered grid velocities
         for (int j = j_min; j <= j_max; ++j) {
             for (int i = i_min; i <= i_max; ++i) {
-                const auto divergence = (u_velocity[j][i] - u_velocity[j][i-1] + 
-                                       v_velocity[j][i] - v_velocity[j-1][i]) * grid_spacing_inv;
+                const auto divergence = (u_corrected[j][i] - u_corrected[j][i-1] + 
+                                       v_corrected[j][i] - v_corrected[j-1][i]) * grid_spacing_inv;
                 max_divergence = std::max(max_divergence, std::abs(divergence));
             }
         }
         
-        const auto total_cells = (j_max - j_min + 1) * (i_max - i_min + 1);
-        const auto average_kinetic_energy = total_kinetic_energy / total_cells;
+        const auto average_kinetic_energy = total_kinetic_energy / (n_interior * n_interior);
         
         // Print formatted statistics
         std::cout << "Step " << std::setw(6) << step_number << "/" << total_time_steps
@@ -472,7 +474,7 @@ private:
                   << " | max|v|=" << std::setprecision(4) << std::setw(8) << max_v_velocity
                   << " | max(div)=" << std::setprecision(2) << std::scientific << std::setw(10) << max_divergence
                   << " | avg_KE=" << std::fixed << std::setprecision(6) << std::setw(10) << average_kinetic_energy
-                  << " | SOR_iter=" << std::setw(4) << sor_iterations << "\n";
+                  << " | SOR_iters=" << std::setw(4) << sor_iterations << "\n";
     }
 };
 
