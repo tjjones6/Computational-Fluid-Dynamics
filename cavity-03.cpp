@@ -11,6 +11,11 @@
  * @author Tyler Jones
  * @date   2025-07-28
  * @version 3.0
+ * 
+ * @todo Fix matrix sizes of u_corrected and v_corrected and BCs
+ * 
+ *  g++ -std=c++17 -O2 -Wall cavity-03.cpp -o cavity
+ *  ./cavity
  */
 
 #include <iostream>
@@ -24,6 +29,7 @@
 #include <tuple>
 #include <cassert>
 #include <stdexcept>
+#include <sys/stat.h>
 
 constexpr char RESET[]   = "\033[0m";
 constexpr char RED[]     = "\033[31m"; 
@@ -78,7 +84,7 @@ private:
     // Physical and numerical parameters
     static constexpr double cavity_length    = 1.0;
     static constexpr double cavity_height    = 1.0;
-    static constexpr int n_interior          = 32;
+    static constexpr int n_interior          = 31;
     static constexpr double reynolds_number  = 100.0;
     static constexpr double lid_velocity     = 1.0;
     static constexpr double density          = 1.0;
@@ -87,6 +93,7 @@ private:
     static constexpr double tolerance_factor = 1e-7;
     static constexpr int max_sor_iterations  = 10000;
     static constexpr int print_interval      = 100;
+    static constexpr int save_data_interval  = 100;
 
     // Derived parameters
     const double kinematic_viscosity;
@@ -111,6 +118,7 @@ private:
     Field v_tentative;
     Field v_corrected;
     Field v_center;
+    
 
 public:
     /**
@@ -478,7 +486,7 @@ private:
     }
 };
 
-} //namespace CavityFlow
+}
 
 /**
  * @brief Main function - entry point for the simulation
