@@ -1,5 +1,5 @@
 /**
- * @file    cavity-03.cpp
+ * @file    cavity-01.cpp
  * @brief   Fully-explicit, staggered-grid lid-driven cavity solver with modern C++ practices and VTK export.
  *
  * @details
@@ -792,4 +792,5 @@ int main() {
         std::cerr << "Unknown error occurred\n";
         return 1;
     }
+
 }
