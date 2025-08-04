@@ -1,16 +1,17 @@
 /**
  * @file    cavity-03.cpp
- * @brief   Fully-explicit, staggered-grid lid-driven cavity solver with modern C++ practices.
+ * @brief   Fully-explicit, staggered-grid lid-driven cavity solver with modern C++ practices and VTK export.
  *
  * @details
  *  • Time scheme:    Forward Euler  
  *  • Diffusion:      2nd-order central  
  *  • Convection:     1st-order central  
  *  • Pressure solver: SOR  
+ *  • Output:         VTK files for ParaView with animation support
  *
  * @author Tyler Jones
  * @date   2025-07-28
- * @version 3.0
+ * @version 3.2
  * 
  * @todo Fix matrix sizes of u_corrected and v_corrected and BCs
  * 
@@ -77,6 +78,229 @@ using VelocityFields = std::pair<Field, Field>;
 }
 
 /**
+ * @brief VTK file writer for structured grid data with animation support
+ */
+class VTKWriter {
+public:
+    /**
+     * @brief Write flow field data to VTK file with time information
+     * @param filename Output filename
+     * @param u_center U-velocity at cell centers
+     * @param v_center V-velocity at cell centers
+     * @param pressure Pressure field
+     * @param grid_spacing Grid spacing
+     * @param n_interior Number of interior grid points
+     * @param time_value Current simulation time for temporal data
+     */
+    static void write_structured_grid(const std::string& filename,
+                                    const Field& u_center,
+                                    const Field& v_center, 
+                                    const Field& pressure,
+                                    double grid_spacing,
+                                    int n_interior,
+                                    double time_value = 0.0) {
+        
+        std::ofstream file(filename);
+        if (!file.is_open()) {
+            throw std::runtime_error("Cannot open file: " + filename);
+        }
+
+        // VTK header with time information
+        file << "# vtk DataFile Version 3.0\n";
+        file << "Lid-Driven Cavity Flow Data - Time: " << std::fixed << std::setprecision(6) << time_value << "\n";
+        file << "ASCII\n";
+        file << "DATASET STRUCTURED_POINTS\n";
+        
+        // Grid dimensions (cell centers)
+        file << "DIMENSIONS " << n_interior << " " << n_interior << " 1\n";
+        
+        // Origin (center of first cell)
+        const double origin_x = grid_spacing * 0.5;
+        const double origin_y = grid_spacing * 0.5;
+        file << "ORIGIN " << origin_x << " " << origin_y << " 0.0\n";
+        
+        // Grid spacing
+        file << "SPACING " << grid_spacing << " " << grid_spacing << " 1.0\n";
+        
+        // Point data with time value
+        const int total_points = n_interior * n_interior;
+        file << "POINT_DATA " << total_points << "\n";
+        
+        // Add time as a scalar field for ParaView temporal support
+        file << "SCALARS TimeValue double 1\n";
+        file << "LOOKUP_TABLE default\n";
+        for (int j = 1; j <= n_interior; ++j) {
+            for (int i = 1; i <= n_interior; ++i) {
+                file << time_value << "\n";
+            }
+        }
+        
+        // Velocity vector field
+        file << "VECTORS velocity double\n";
+        for (int j = 1; j <= n_interior; ++j) {
+            for (int i = 1; i <= n_interior; ++i) {
+                file << u_center[j][i] << " " << v_center[j][i] << " 0.0\n";
+            }
+        }
+        
+        // U-velocity scalar field
+        file << "SCALARS u_velocity double 1\n";
+        file << "LOOKUP_TABLE default\n";
+        for (int j = 1; j <= n_interior; ++j) {
+            for (int i = 1; i <= n_interior; ++i) {
+                file << u_center[j][i] << "\n";
+            }
+        }
+        
+        // V-velocity scalar field
+        file << "SCALARS v_velocity double 1\n";
+        file << "LOOKUP_TABLE default\n";
+        for (int j = 1; j <= n_interior; ++j) {
+            for (int i = 1; i <= n_interior; ++i) {
+                file << v_center[j][i] << "\n";
+            }
+        }
+        
+        // Velocity magnitude
+        file << "SCALARS velocity_magnitude double 1\n";
+        file << "LOOKUP_TABLE default\n";
+        for (int j = 1; j <= n_interior; ++j) {
+            for (int i = 1; i <= n_interior; ++i) {
+                const double mag = std::sqrt(u_center[j][i] * u_center[j][i] + 
+                                           v_center[j][i] * v_center[j][i]);
+                file << mag << "\n";
+            }
+        }
+        
+        // Pressure field
+        file << "SCALARS pressure double 1\n";
+        file << "LOOKUP_TABLE default\n";
+        for (int j = 1; j <= n_interior; ++j) {
+            for (int i = 1; i <= n_interior; ++i) {
+                file << pressure[j][i] << "\n";
+            }
+        }
+        
+        // Vorticity calculation (useful for cavity flow visualization)
+        file << "SCALARS vorticity double 1\n";
+        file << "LOOKUP_TABLE default\n";
+        const double dx_inv = 1.0 / grid_spacing;
+        for (int j = 1; j <= n_interior; ++j) {
+            for (int i = 1; i <= n_interior; ++i) {
+                double vorticity = 0.0;
+                
+                // Central differences for interior points
+                if (i > 1 && i < n_interior && j > 1 && j < n_interior) {
+                    const double dvdx = (v_center[j][i+1] - v_center[j][i-1]) * dx_inv * 0.5;
+                    const double dudy = (u_center[j+1][i] - u_center[j-1][i]) * dx_inv * 0.5;
+                    vorticity = dvdx - dudy;
+                }
+                // One-sided differences for boundary points
+                else {
+                    // Use available neighbors for boundary points
+                    double dvdx = 0.0, dudy = 0.0;
+                    
+                    if (i == 1) {
+                        dvdx = (v_center[j][i+1] - v_center[j][i]) * dx_inv;
+                    } else if (i == n_interior) {
+                        dvdx = (v_center[j][i] - v_center[j][i-1]) * dx_inv;
+                    } else {
+                        dvdx = (v_center[j][i+1] - v_center[j][i-1]) * dx_inv * 0.5;
+                    }
+                    
+                    if (j == 1) {
+                        dudy = (u_center[j+1][i] - u_center[j][i]) * dx_inv;
+                    } else if (j == n_interior) {
+                        dudy = (u_center[j][i] - u_center[j-1][i]) * dx_inv;
+                    } else {
+                        dudy = (u_center[j+1][i] - u_center[j-1][i]) * dx_inv * 0.5;
+                    }
+                    
+                    vorticity = dvdx - dudy;
+                }
+                
+                file << vorticity << "\n";
+            }
+        }
+        
+        file.close();
+        
+        if (file.fail()) {
+            throw std::runtime_error("Error writing to file: " + filename);
+        }
+    }
+    
+    /**
+     * @brief Generate filename with proper ParaView time series convention
+     * @param base_name Base filename
+     * @param time_step Current time step
+     * @param time Current simulation time
+     * @return Formatted filename for ParaView time series
+     */
+    static std::string generate_filename(const std::string& base_name, 
+                                       int time_step, 
+                                       double time) {
+        std::ostringstream oss;
+        // Use zero-padded format that ParaView recognizes for time series
+        oss << base_name << "_" << std::setfill('0') << std::setw(6) << time_step << ".vtk";
+        return oss.str();
+    }
+    
+    /**
+     * @brief Write a ParaView collection file (.pvd) for time series animation
+     * @param collection_filename Name of the collection file
+     * @param vtk_filenames Vector of VTK filenames
+     * @param time_values Vector of corresponding time values
+     */
+    static void write_paraview_collection(const std::string& collection_filename,
+                                        const std::vector<std::string>& vtk_filenames,
+                                        const std::vector<double>& time_values) {
+        if (vtk_filenames.size() != time_values.size()) {
+            throw std::invalid_argument("VTK filenames and time values must have the same size");
+        }
+        
+        std::ofstream file(collection_filename);
+        if (!file.is_open()) {
+            throw std::runtime_error("Cannot open collection file: " + collection_filename);
+        }
+        
+        // Write PVD header
+        file << "<?xml version=\"1.0\"?>\n";
+        file << "<VTKFile type=\"Collection\" version=\"0.1\" byte_order=\"LittleEndian\">\n";
+        file << "  <Collection>\n";
+        
+        // Write dataset entries
+        for (size_t i = 0; i < vtk_filenames.size(); ++i) {
+            file << "    <DataSet timestep=\"" << std::fixed << std::setprecision(6) 
+                 << time_values[i] << "\" group=\"\" part=\"0\" file=\"" 
+                 << vtk_filenames[i] << "\"/>\n";
+        }
+        
+        file << "  </Collection>\n";
+        file << "</VTKFile>\n";
+        
+        file.close();
+        
+        if (file.fail()) {
+            throw std::runtime_error("Error writing collection file: " + collection_filename);
+        }
+    }
+    
+    /**
+     * @brief Create output directory if it doesn't exist
+     * @param directory_path Path to create
+     */
+    static void create_output_directory(const std::string& directory_path) {
+        try {
+            std::filesystem::create_directories(directory_path);
+        } catch (const std::filesystem::filesystem_error& e) {
+            throw std::runtime_error("Failed to create directory: " + directory_path + 
+                                   " Error: " + e.what());
+        }
+    }
+};
+
+/**
  * @brief Main solver class for lid-driven cavity flow
  */
 class CavitySolver {
@@ -84,13 +308,13 @@ private:
     // Physical and numerical parameters
     static constexpr double cavity_length    = 1.0;
     static constexpr double cavity_height    = 1.0;
-    static constexpr int n_interior          = 31;
-    static constexpr double reynolds_number  = 100.0;
+    static constexpr int n_interior          = 63;
+    static constexpr double reynolds_number  = 1000.0;
     static constexpr double lid_velocity     = 1.0;
     static constexpr double density          = 1.0;
     static constexpr double cfl_number       = 0.5;
     static constexpr double final_time       = 20.0;
-    static constexpr double tolerance_factor = 1e-7;
+    static constexpr double tolerance_factor = 1e-9;
     static constexpr int max_sor_iterations  = 10000;
     static constexpr int print_interval      = 100;
     static constexpr int save_data_interval  = 100;
@@ -119,6 +343,10 @@ private:
     Field v_corrected;
     Field v_center;
     
+    // Output directory and tracking
+    const std::string output_directory = "vtk_output";
+    std::vector<std::string> exported_vtk_files;
+    std::vector<double> exported_time_values;
 
 public:
     /**
@@ -134,9 +362,10 @@ public:
         , i_max(static_cast<int>(cavity_length * n_interior))
         , j_max(static_cast<int>(cavity_height * n_interior))
     {
-        validate_parameters();
-        allocate_fields();
-        print_simulation_info();
+        validateParameters();
+        allocateFields();
+        setupOutputDirectory();
+        printSimulationInfo();
     }
 
     /**
@@ -147,21 +376,37 @@ public:
                   <<"Starting simulation...\n"
                   << RESET;
         
+        // Export initial conditions
+        applyBoundaryConditions();
+        interpolateToCellCenters();
+        exportData(0, 0.0);
+        
         for (int time_step_idx = 1; time_step_idx <= total_time_steps; ++time_step_idx) {
             const auto current_time = time_step_idx * time_step;
             
-            apply_boundary_conditions();
+            applyBoundaryConditions();
             computeTentativeVelocities();
-            const auto [sor_iterations, residual] = solve_pressure_poisson();
+            const auto [sor_iterations, residual] = solverPressurePoisson();
             applyPressureCorrection();
 
             if (time_step_idx % print_interval == 0 || time_step_idx == total_time_steps) {
-                log_statistics(time_step_idx, current_time, sor_iterations);
+                logStatistics(time_step_idx, current_time, sor_iterations);
+            }
+            
+            // Export data at specified intervals
+            if (time_step_idx % save_data_interval == 0 || time_step_idx == total_time_steps) {
+                interpolateToCellCenters();
+                exportData(time_step_idx, current_time);
             }
         }
         
+        // Create ParaView collection file for animation
+        createParaviewCollection();
+        
         std::cout << GREEN
                   <<"Simulation completed successfully!\n"
+                  <<"VTK files saved in directory: " << output_directory << "\n"
+                  <<"Open '" << output_directory << "/cavity_flow_animation.pvd' in ParaView for animation\n"
                   << RESET;
     }
 
@@ -169,7 +414,7 @@ private:
     /**
      * @brief Validate input parameters for physical consistency
      */
-    void validate_parameters() const {
+    void validateParameters() const {
         static_assert(n_interior > 0, "Grid size must be positive!");
         static_assert(reynolds_number > 0, "Reynolds number must be positive!");
         static_assert(cfl_number > 0 && cfl_number < 1, "CFL number must be between 0 and 1!");
@@ -183,7 +428,7 @@ private:
     /**
      * @brief Allocate memory for all flow fields
      */
-    void allocate_fields() {
+    void allocateFields() {
         try {
             pressure          = create_field(j_max + 2, i_max + 2);
             source_term       = create_field(j_max + 2, i_max + 2);
@@ -200,9 +445,60 @@ private:
     }
 
     /**
+     * @brief Setup output directory for VTK files
+     */
+    void setupOutputDirectory() {
+        try {
+            VTKWriter::create_output_directory(output_directory);
+            std::cout << BLUE << "Created output directory: " << output_directory << RESET << "\n";
+        } catch (const std::exception& e) {
+            throw std::runtime_error("Failed to setup output directory: " + std::string(e.what()));
+        }
+    }
+
+    /**
+     * @brief Export flow field data to VTK file
+     * @param time_step_idx Current time step index
+     * @param current_time Current simulation time
+     */
+    void exportData(int time_step_idx, double current_time) {
+        try {
+            const auto filename = VTKWriter::generate_filename("cavity_flow", time_step_idx, current_time);
+            const auto filepath = output_directory + "/" + filename;
+            
+            VTKWriter::write_structured_grid(filepath, u_center, v_center, pressure, 
+                                            grid_spacing, n_interior, current_time);
+            
+            // Track exported files for collection
+            exported_vtk_files.push_back(filename);
+            exported_time_values.push_back(current_time);
+            
+            if (time_step_idx % print_interval == 0 || time_step_idx == 0) {
+                std::cout << BLUE << "Exported VTK file: " << filename << RESET << "\n";
+            }
+        } catch (const std::exception& e) {
+            std::cerr << RED << "Error exporting VTK data: " << e.what() << RESET << "\n";
+        }
+    }
+    
+    /**
+     * @brief Create ParaView collection file for time series animation
+     */
+    void createParaviewCollection() {
+        try {
+            const auto collection_filepath = output_directory + "/cavity_flow_animation.pvd";
+            VTKWriter::write_paraview_collection(collection_filepath, exported_vtk_files, exported_time_values);
+            
+            std::cout << CYAN << "Created ParaView collection file: cavity_flow_animation.pvd" << RESET << "\n";
+        } catch (const std::exception& e) {
+            std::cerr << RED << "Error creating ParaView collection: " << e.what() << RESET << "\n";
+        }
+    }
+
+    /**
      * @brief Print simulation parameters and setup information
      */
-    void print_simulation_info() const {
+    void printSimulationInfo() const {
         std::cout << std::fixed << std::setprecision(6);
         std::cout << CYAN
                   << "=== Lid-Driven Cavity Flow Simulation ===\n"
@@ -216,6 +512,7 @@ private:
                   << ", kinematic viscosity=" << kinematic_viscosity 
                   << ", CFL=" << cfl_number << "\n"
                   << "Relaxation factor=" << optimal_omega << "\n"
+                  << "VTK export interval=" << save_data_interval << " steps\n"
                   << "==========================================\n"
                   << RESET << "\n";
     }
@@ -223,7 +520,7 @@ private:
     /**
      * @brief Apply Nuemann boundary conditions using ghost cell method
      */
-    void apply_boundary_conditions() noexcept {
+    void applyBoundaryConditions() noexcept {
         // North lid (moving wall) - u velocity
         for (int i = 0; i <= i_max; ++i) {
             u_corrected[j_max + 1][i] = 2.0 * lid_velocity - u_corrected[j_max][i];
@@ -309,7 +606,7 @@ private:
      * @brief Solve pressure Poisson equation using SOR iteration
      * @return Pair of (iterations, final_residual)
      */
-    [[nodiscard]] SolverResult solve_pressure_poisson() {
+    [[nodiscard]] SolverResult solverPressurePoisson() {
         auto pressure_old = create_field(j_max + 2, i_max + 2);
         auto pressure_new = create_field(j_max + 2, i_max + 2);
         
@@ -417,7 +714,7 @@ private:
      * @brief Interpolate staggered velocities to cell centers
      * @return Pair of (u_center, v_center) fields
      */
-    [[nodiscard]] VelocityFields interpolate_to_cell_centers() noexcept {
+    [[nodiscard]] VelocityFields interpolateToCellCenters() noexcept {
         // Interpolate u-velocity to cell centers
         for (int j = j_min; j <= j_max; ++j) {
             for (int i = i_min; i <= i_max; ++i) {
@@ -441,11 +738,9 @@ private:
      * @param current_time Current simulation time
      * @param sor_iterations Number of SOR iterations used
      */
-    void log_statistics(int step_number, double current_time, int sor_iterations) {
-        const auto [u_center, v_center] = interpolate_to_cell_centers();
+    void logStatistics(int step_number, double current_time, int sor_iterations) {
+        const auto [u_center, v_center] = interpolateToCellCenters();
         
-        auto max_u_velocity = 0.0;
-        auto max_v_velocity = 0.0;
         auto max_divergence = 0.0;
         auto total_kinetic_energy = 0.0;
         
@@ -454,11 +749,6 @@ private:
         // Compute velocity statistics and kinetic energy
         for (int j = j_min; j <= j_max; ++j) {
             for (int i = i_min; i <= i_max; ++i) {
-                // Velocity magnitudes
-                max_u_velocity = std::max(max_u_velocity, std::abs(u_center[j][i]));
-                max_v_velocity = std::max(max_v_velocity, std::abs(v_center[j][i]));
-
-                // Kinetic energy per cell: KE = 0.5 * (u² + v²)
                 total_kinetic_energy += 0.5 * (u_center[j][i] * u_center[j][i] + 
                                               v_center[j][i] * v_center[j][i]);
             }
@@ -478,14 +768,11 @@ private:
         // Print formatted statistics
         std::cout << "Step " << std::setw(6) << step_number << "/" << total_time_steps
                   << " | t=" << std::fixed << std::setprecision(2) << std::setw(6) << current_time 
-                  << " | max|u|=" << std::setprecision(4) << std::setw(8) << max_u_velocity
-                  << " | max|v|=" << std::setprecision(4) << std::setw(8) << max_v_velocity
                   << " | max(div)=" << std::setprecision(2) << std::scientific << std::setw(10) << max_divergence
                   << " | avg_KE=" << std::fixed << std::setprecision(6) << std::setw(10) << average_kinetic_energy
                   << " | SOR_iters=" << std::setw(4) << sor_iterations << "\n";
     }
 };
-
 }
 
 /**
