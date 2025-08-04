@@ -15,7 +15,7 @@
  * 
  * @todo Fix matrix sizes of u_corrected and v_corrected and BCs
  * 
- *  g++ -std=c++17 -O2 -Wall cavity-03.cpp -o cavity
+ *  g++ -std=c++17 -O2 -Wall cavity-01.cpp -o cavity
  *  ./cavity
  */
 
@@ -794,4 +794,5 @@ int main() {
     }
 
 }
+
 
