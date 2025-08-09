@@ -1,840 +1,491 @@
-/**
- * @file    channel-01.cpp
- * @brief   Fully-explicit, staggered-grid, projection method channel flow solver.
- *          We are using a velocity inlet and pressure outlet
- *
- * @details
- *  * Time scheme:     Forward Euler  
- *  * Diffusion:       2nd-order central  
- *  * Convection:      1st-order central  
- *  * Pressure solver: SOR  
- *  * Output:          VTK files for ParaView with animation support
- *
- * @author  Tyler Jones
- * @date    2025-08-04
- * @version 2.0
- * 
- * @todo Compute vorticity in the main solver
- * 
- *  g++ -std=c++17 -O2 -Wall channel-01.cpp -o channel
- *  ./channel
- */
+// Channel flow on a rectangular domain using a staggered MAC grid + projection (explicit FE)
+// THIS CODE WORKS
 
-#include <iostream>
-#include <vector>
-#include <cmath>
 #include <algorithm>
+#include <cmath>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
-#include <sstream>
-#include <filesystem>
-#include <tuple>
-#include <cassert>
+#include <iostream>
 #include <stdexcept>
-#include <sys/stat.h>
-
-constexpr char RESET[]   = "\033[0m";
-constexpr char RED[]     = "\033[31m"; 
-constexpr char GREEN[]   = "\033[32m";  
-constexpr char YELLOW[]  = "\033[33m";  
-constexpr char BLUE[]    = "\033[34m"; 
-constexpr char MAGENTA[] = "\033[35m"; 
-constexpr char CYAN[]    = "\033[36m";
+#include <string>
+#include <tuple>
+#include <vector>
+#include <sstream>  // Added missing header for std::ostringstream
 
 namespace ChannelFlow {
+
+// ANSI colors for pretty logs (safe to ignore if your terminal doesn't support them)
+constexpr const char* RESET   = "\033[0m";   // Fixed escape sequences
+constexpr const char* RED     = "\033[31m";
+constexpr const char* GREEN   = "\033[32m";
+constexpr const char* YELLOW  = "\033[33m";
+constexpr const char* BLUE    = "\033[34m";
+constexpr const char* CYAN    = "\033[36m";
 
 using Field = std::vector<std::vector<double>>;
 using SolverResult = std::pair<int, double>;
 using VelocityFields = std::pair<Field, Field>;
 
-/**
- * @brief Create a 2D field initialized with a given value
- * @param rows Number of rows
- * @param cols Number of columns  
- * @param initial_value Initial value for all elements
- * @return Initialized 2D field
- */
+// Allocate a 2D field (rows x cols) filled with initial_value
 [[nodiscard]] Field createField(int rows, int cols, double initial_value = 0.0) {
-    if (rows <= 0 || cols <= 0) {
-        throw std::invalid_argument("Field dimensions must be positive");
-    }
-    
-    Field field;
-    field.reserve(rows);
-    for (int i = 0; i < rows; ++i) {
-        field.emplace_back(cols, initial_value);
-    }
-    return field;
+    if (rows <= 0 || cols <= 0) throw std::invalid_argument("Field dims must be positive");
+    Field f; f.reserve(rows);
+    for (int r = 0; r < rows; ++r) f.emplace_back(cols, initial_value);
+    return f;
 }
 
-/**
- * @brief Compute optimal SOR relaxation parameter
- * @param n_interior Number of interior grid points per dimension
- * @return Optimal omega value
- */
-[[nodiscard]] constexpr double computeOptimalOmega(int n_interior) noexcept {
+// 2D SOR omega estimate from Jacobi spectral radius approximation
+[[nodiscard]] constexpr double computeOptimalOmega2D(int nx, int ny) noexcept {
     constexpr double pi = 3.14159265358979323846;
-    const auto rho_jacobi = std::cos(pi / (n_interior + 1));
-    return 2.0 / (1.0 + std::sqrt(1.0 - rho_jacobi * rho_jacobi));
+    const double rho_j = 0.5 * (std::cos(pi / (nx + 1)) + std::cos(pi / (ny + 1)));
+    const double denom = 1.0 + std::sqrt(std::max(1e-14, 1.0 - rho_j * rho_j));
+    return 2.0 / denom; // typically ~1.7–1.95
 }
 
-/**
- * @brief VTK file writer for structured grid data with animation support
- */
+// ---------------- VTK writer ----------------
 class VTKWriter {
 public:
-    /**
-     * @brief Write flow field data to VTK file with time information
-     * @param filename Output filename
-     * @param u_center U-velocity at cell centers
-     * @param v_center V-velocity at cell centers
-     * @param pressure Pressure field
-     * @param grid_spacing Grid spacing
-     * @param n_interior Number of interior grid points
-     * @param time_value Current simulation time for temporal data
-     */
     static void writeStructuredGrid(const std::string& filename,
                                     const Field& u_center,
-                                    const Field& v_center, 
+                                    const Field& v_center,
                                     const Field& pressure,
-                                    double grid_spacing,
-                                    int n_interior,
+                                    int nx, int ny,
+                                    double dx, double dy,
                                     double time_value = 0.0) {
-        
         std::ofstream file(filename);
-        if (!file.is_open()) {
-            throw std::runtime_error("Cannot open file: " + filename);
-        }
+        if (!file) throw std::runtime_error("Cannot open VTK: " + filename);
 
-        // VTK header with time information
         file << "# vtk DataFile Version 3.0\n";
         file << "Channel Flow Data - Time: " << std::fixed << std::setprecision(6) << time_value << "\n";
         file << "ASCII\n";
         file << "DATASET STRUCTURED_POINTS\n";
-        
-        // Grid dimensions (cell centers)
-        file << "DIMENSIONS " << n_interior << " " << n_interior << " 1\n";
-        
-        // Origin (center of first cell)
-        const double origin_x = grid_spacing * 0.5;
-        const double origin_y = grid_spacing * 0.5;
-        file << "ORIGIN " << origin_x << " " << origin_y << " 0.0\n";
-        
-        // Grid spacing
-        file << "SPACING " << grid_spacing << " " << grid_spacing << " 1.0\n";
-        
-        // Point data with time value
-        const int total_points = n_interior * n_interior;
+        file << "DIMENSIONS " << nx << " " << ny << " 1\n";
+        file << "ORIGIN " << dx * 0.5 << " " << dy * 0.5 << " 0.0\n";
+        file << "SPACING " << dx << " " << dy << " 1.0\n";
+        const int total_points = nx * ny;
         file << "POINT_DATA " << total_points << "\n";
-        
-        // Add time as a scalar field for ParaView temporal support
-        file << "SCALARS TimeValue double 1\n";
-        file << "LOOKUP_TABLE default\n";
-        for (int j = 1; j <= n_interior; ++j) {
-            for (int i = 1; i <= n_interior; ++i) {
+
+        file << "SCALARS TimeValue double 1\nLOOKUP_TABLE default\n";
+        for (int j = 1; j <= ny; ++j)
+            for (int i = 1; i <= nx; ++i)
                 file << time_value << "\n";
-            }
-        }
-        
-        // Velocity vector field
+
         file << "VECTORS velocity double\n";
-        for (int j = 1; j <= n_interior; ++j) {
-            for (int i = 1; i <= n_interior; ++i) {
+        for (int j = 1; j <= ny; ++j)
+            for (int i = 1; i <= nx; ++i)
                 file << u_center[j][i] << " " << v_center[j][i] << " 0.0\n";
-            }
-        }
-        
-        // U-velocity scalar field
-        file << "SCALARS u_velocity double 1\n";
-        file << "LOOKUP_TABLE default\n";
-        for (int j = 1; j <= n_interior; ++j) {
-            for (int i = 1; i <= n_interior; ++i) {
+
+        file << "SCALARS u_velocity double 1\nLOOKUP_TABLE default\n";
+        for (int j = 1; j <= ny; ++j)
+            for (int i = 1; i <= nx; ++i)
                 file << u_center[j][i] << "\n";
-            }
-        }
-        
-        // V-velocity scalar field
-        file << "SCALARS v_velocity double 1\n";
-        file << "LOOKUP_TABLE default\n";
-        for (int j = 1; j <= n_interior; ++j) {
-            for (int i = 1; i <= n_interior; ++i) {
+
+        file << "SCALARS v_velocity double 1\nLOOKUP_TABLE default\n";
+        for (int j = 1; j <= ny; ++j)
+            for (int i = 1; i <= nx; ++i)
                 file << v_center[j][i] << "\n";
-            }
-        }
-        
-        // Velocity magnitude
-        file << "SCALARS velocity_magnitude double 1\n";
-        file << "LOOKUP_TABLE default\n";
-        for (int j = 1; j <= n_interior; ++j) {
-            for (int i = 1; i <= n_interior; ++i) {
-                const double mag = std::sqrt(u_center[j][i] * u_center[j][i] + 
-                                           v_center[j][i] * v_center[j][i]);
+
+        file << "SCALARS velocity_magnitude double 1\nLOOKUP_TABLE default\n";
+        for (int j = 1; j <= ny; ++j) {
+            for (int i = 1; i <= nx; ++i) {
+                const double mag = std::sqrt(u_center[j][i] * u_center[j][i] + v_center[j][i] * v_center[j][i]);
                 file << mag << "\n";
             }
         }
-        
-        // Pressure field
-        file << "SCALARS pressure double 1\n";
-        file << "LOOKUP_TABLE default\n";
-        for (int j = 1; j <= n_interior; ++j) {
-            for (int i = 1; i <= n_interior; ++i) {
+
+        file << "SCALARS pressure double 1\nLOOKUP_TABLE default\n";
+        for (int j = 1; j <= ny; ++j)
+            for (int i = 1; i <= nx; ++i)
                 file << pressure[j][i] << "\n";
+
+        // simple vorticity estimate with non-square spacing
+        file << "SCALARS vorticity double 1\nLOOKUP_TABLE default\n";
+        const double idx = 1.0 / dx, idy = 1.0 / dy;
+        for (int j = 1; j <= ny; ++j) {
+            for (int i = 1; i <= nx; ++i) {
+                double dvdx = 0.0, dudy = 0.0;
+                if (i == 1)       dvdx = (v_center[j][i+1] - v_center[j][i]) * idx;
+                else if (i == nx) dvdx = (v_center[j][i]   - v_center[j][i-1]) * idx;
+                else              dvdx = 0.5 * (v_center[j][i+1] - v_center[j][i-1]) * idx;
+                if (j == 1)       dudy = (u_center[j+1][i] - u_center[j][i]) * idy;
+                else if (j == ny) dudy = (u_center[j][i]   - u_center[j-1][i]) * idy;
+                else              dudy = 0.5 * (u_center[j+1][i] - u_center[j-1][i]) * idy;
+                file << (dvdx - dudy) << "\n";
             }
-        }
-        
-        // Vorticity calculation
-        file << "SCALARS vorticity double 1\n";
-        file << "LOOKUP_TABLE default\n";
-        const double dx_inv = 1.0 / grid_spacing;
-        for (int j = 1; j <= n_interior; ++j) {
-            for (int i = 1; i <= n_interior; ++i) {
-                double vorticity = 0.0;
-                
-                // Central differences for interior points
-                if (i > 1 && i < n_interior && j > 1 && j < n_interior) {
-                    const double dvdx = (v_center[j][i+1] - v_center[j][i-1]) * dx_inv * 0.5;
-                    const double dudy = (u_center[j+1][i] - u_center[j-1][i]) * dx_inv * 0.5;
-                    vorticity = dvdx - dudy;
-                }
-                // One-sided differences for boundary points
-                else {
-                    // Use available neighbors for boundary points
-                    double dvdx = 0.0, dudy = 0.0;
-                    
-                    if (i == 1) {
-                        dvdx = (v_center[j][i+1] - v_center[j][i]) * dx_inv;
-                    } else if (i == n_interior) {
-                        dvdx = (v_center[j][i] - v_center[j][i-1]) * dx_inv;
-                    } else {
-                        dvdx = (v_center[j][i+1] - v_center[j][i-1]) * dx_inv * 0.5;
-                    }
-                    
-                    if (j == 1) {
-                        dudy = (u_center[j+1][i] - u_center[j][i]) * dx_inv;
-                    } else if (j == n_interior) {
-                        dudy = (u_center[j][i] - u_center[j-1][i]) * dx_inv;
-                    } else {
-                        dudy = (u_center[j+1][i] - u_center[j-1][i]) * dx_inv * 0.5;
-                    }
-                    
-                    vorticity = dvdx - dudy;
-                }
-                
-                file << vorticity << "\n";
-            }
-        }
-        
-        file.close();
-        
-        if (file.fail()) {
-            throw std::runtime_error("Error writing to file: " + filename);
         }
     }
-    
-    /**
-     * @brief Generate filename with proper ParaView time series convention
-     * @param base_name Base filename
-     * @param time_step Current time step
-     * @param time Current simulation time
-     * @return Formatted filename for ParaView time series
-     */
-    static std::string generate_filename(const std::string& base_name, 
-                                       int time_step, 
-                                       double time) {
+
+    static std::string generate_filename(const std::string& base_name, int time_step) {
         std::ostringstream oss;
-        // Use zero-padded format that ParaView recognizes for time series
         oss << base_name << "_" << std::setfill('0') << std::setw(6) << time_step << ".vtk";
         return oss.str();
     }
-    
-    /**
-     * @brief Write a ParaView collection file (.pvd) for time series animation
-     * @param collection_filename Name of the collection file
-     * @param vtk_filenames Vector of VTK filenames
-     * @param time_values Vector of corresponding time values
-     */
+
     static void write_paraview_collection(const std::string& collection_filename,
-                                        const std::vector<std::string>& vtk_filenames,
-                                        const std::vector<double>& time_values) {
-        if (vtk_filenames.size() != time_values.size()) {
-            throw std::invalid_argument("VTK filenames and time values must have the same size");
-        }
-        
+                                          const std::vector<std::string>& vtk_filenames,
+                                          const std::vector<double>& time_values) {
+        if (vtk_filenames.size() != time_values.size())
+            throw std::invalid_argument("VTK filenames and time values must have same size");
         std::ofstream file(collection_filename);
-        if (!file.is_open()) {
-            throw std::runtime_error("Cannot open collection file: " + collection_filename);
-        }
-        
-        // Write PVD header
+        if (!file) throw std::runtime_error("Cannot open PVD: " + collection_filename);
         file << "<?xml version=\"1.0\"?>\n";
         file << "<VTKFile type=\"Collection\" version=\"0.1\" byte_order=\"LittleEndian\">\n";
         file << "  <Collection>\n";
-        
-        // Write dataset entries
         for (size_t i = 0; i < vtk_filenames.size(); ++i) {
-            file << "    <DataSet timestep=\"" << std::fixed << std::setprecision(6) 
-                 << time_values[i] << "\" group=\"\" part=\"0\" file=\"" 
-                 << vtk_filenames[i] << "\"/>\n";
+            file << "    <DataSet timestep=\"" << std::fixed << std::setprecision(6) << time_values[i]
+                 << "\" group=\"\" part=\"0\" file=\"" << vtk_filenames[i] << "\"/>\n";
         }
-        
         file << "  </Collection>\n";
         file << "</VTKFile>\n";
-        
-        file.close();
-        
-        if (file.fail()) {
-            throw std::runtime_error("Error writing collection file: " + collection_filename);
-        }
     }
-    
-    /**
-     * @brief Create output directory if it doesn't exist
-     * @param directory_path Path to create
-     */
+
     static void create_output_directory(const std::string& directory_path) {
-        try {
-            std::filesystem::create_directories(directory_path);
-        } catch (const std::filesystem::filesystem_error& e) {
-            throw std::runtime_error("Failed to create directory: " + directory_path + 
-                                   " Error: " + e.what());
-        }
+        std::filesystem::create_directories(directory_path);
     }
 };
 
-/**
- * @brief Main solver class for lid-driven cavity flow
- */
+// ---------------- Channel solver ----------------
 class ChannelSolver {
 private:
-    // Physical and numerical parameters
-    static constexpr double LENGTH             = 1.0;    // Cavity length
-    static constexpr double HEIGHT             = 1.0;    // Cavity height
-    static constexpr int    n_interior         = 31;     // Number of interior nodes per axis
-    static constexpr double REYNOLDS_NUMBER    = 100.0;  // Re = inertial/viscous forces = (U*L) / nu 
-    static constexpr double INLET_VELOCITY     = 1.0;    // Velocity of inlet
-    static constexpr double DENSITY            = 1.0;    // Density of the fluid
-    static constexpr double CFL                = 0.5;    // Stability factor
-    static constexpr double final_time         = 10.0;   // Final time of simulation
-    static constexpr double TOLERANCE_FACTOR   = 1e-7;   // Tolerance factor for SOR algorithm
-    static constexpr int    MAX_SOR_ITERS      = 10000;  // Maximum number of SOR sweeps
-    static constexpr int    PRINT_INTERVAL     = 100;    // Interval for stats printed to terminal
-    static constexpr int    SAVE_DATA_INTERVAL = 100;    // Interval for vtk snapshots/data export
+    static constexpr double LENGTH        = 3.0;   // domain length (x)
+    static constexpr double HEIGHT        = 1.0;   // domain height (y)
+    static constexpr int    NX_INT        = 93;    // interior cells in x
+    static constexpr int    NY_INT        = 31;    // interior cells in y
+    static constexpr double RE            = 100.0; // Reynolds number
+    static constexpr double U_IN          = 1.0;   // inlet bulk velocity
+    static constexpr double RHO           = 1.0;   // density
+    static constexpr double CFL           = 0.25;   // Courant safety
+    static constexpr double T_FINAL       = 10.0;  // final time
+    static constexpr double TOL_FACTOR    = 1e-7;  // relative PPE tol
+    static constexpr double ABS_TOL       = 1e-10; // absolute PPE tol
+    static constexpr int    MAX_SOR_ITERS = 10000; // SOR cap
+    static constexpr int    PRINT_INTERVAL= 100;   // log cadence
+    static constexpr int    SAVE_INTERVAL = 100;   // VTK cadence
 
-    // Derived parameters
-    const double kinematic_viscosity;
-    const double grid_spacing;
-    const double optimal_omega;
-    const double time_step;
-    const int total_time_steps;
-    
-    // Grid indexing helpers
-    const int i_min = 1;   // First interior i index for cell center
-    const int i_max;       // Last interior i index for cell center
-    const int j_min = 1;   // First interior j index for cell center
-    const int j_max;       // Last interior j index for cell center
+    // Derived
+    const double nu;           // kinematic viscosity = U*H/Re
+    const int    nx, ny;       // interior counts
+    const double dx, dy;       // spacings
+    const double omega;        // SOR relaxation
+    const double dt;           // timestep
+    const int    nsteps;       // total steps
 
-    // Flow fields
-    Field pressure;
-    Field source_term;
-    Field poisson_residual;
-    Field u_tentative;
-    Field u_corrected;
-    Field u_center;
-    Field v_tentative;
-    Field v_corrected;
-    Field v_center;
-    
-    // Output directory and tracking
-    const std::string output_directory = "vtk_output";
-    std::vector<std::string> exported_vtk_files;
-    std::vector<double> exported_time_values;
+    // Index extents for interior centers
+    const int i_min = 1, j_min = 1;
+    const int i_max, j_max;
+
+    // Fields (staggered sizes)
+    Field p, rhs, res;                 // (ny+2) x (nx+2)
+    Field u_star, u, u_cc;             // u: (ny+2) x (nx+1)
+    Field v_star, v, v_cc;             // v: (ny+1) x (nx+2)
+
+    // Output bookkeeping
+    const std::string out_dir = "vtk_output";
+    std::vector<std::string> vtk_files;
+    std::vector<double>      vtk_times;
 
 public:
-    /**
-     * @brief Constructor - initializes solver parameters and allocates memory
-     */
-    ChannelSolver() 
-        : kinematic_viscosity(DENSITY * INLET_VELOCITY * HEIGHT / REYNOLDS_NUMBER)
-        , grid_spacing(HEIGHT / n_interior)
-        , optimal_omega(computeOptimalOmega(n_interior))
-        , time_step(CFL * std::min(0.25 * grid_spacing * grid_spacing / kinematic_viscosity, 
-                                         grid_spacing / INLET_VELOCITY))
-        , total_time_steps(static_cast<int>(final_time / time_step))
-        , i_max(static_cast<int>(LENGTH * n_interior))
-        , j_max(static_cast<int>(HEIGHT * n_interior))
-    {
-        validateParameters();
-        allocateFields();
-        setupOutputDirectory();
-        printSimulationInfo();
+    ChannelSolver()
+        : nu(U_IN * HEIGHT / RE)
+        , nx(NX_INT), ny(NY_INT)
+        , dx(LENGTH / NX_INT), dy(HEIGHT / NY_INT)
+        , omega(computeOptimalOmega2D(NX_INT, NY_INT))
+        , dt(CFL * std::min(0.25 * std::min(dx, dy) * std::min(dx, dy) / nu,
+                            std::min(dx, dy) / std::max(1e-12, U_IN)))
+        , nsteps(static_cast<int>(T_FINAL / dt))
+        , i_max(nx), j_max(ny)
+        , p(createField(j_max + 2, i_max + 2, 0.0))
+        , rhs(createField(j_max + 2, i_max + 2, 0.0))
+        , res(createField(j_max + 2, i_max + 2, 0.0))
+        , u_star(createField(j_max + 2, i_max + 1, 0.0))
+        , u(createField(j_max + 2, i_max + 1, 0.0))
+        , u_cc(createField(j_max + 2, i_max + 2, 0.0))
+        , v_star(createField(j_max + 1, i_max + 2, 0.0))
+        , v(createField(j_max + 1, i_max + 2, 0.0))
+        , v_cc(createField(j_max + 2, i_max + 2, 0.0)) {
+        validate();
+        VTKWriter::create_output_directory(out_dir);
+        printHeader();
+        applyVelocityBC(u, v);          // enforce ICs at boundaries
+        interpolateToCellCenters();
+        exportVTK(0, 0.0);
     }
 
-    /**
-     * @brief Run the complete simulation
-     */
     void run() {
-        std::cout << GREEN
-                  <<"Starting simulation...\n"
-                  << RESET;
-        
-        // Export initial conditions
-        applyBoundaryConditions();
-        interpolateToCellCenters();
-        exportData(0, 0.0);
-        
-        for (int time_step_idx = 1; time_step_idx <= total_time_steps; ++time_step_idx) {
-            const auto current_time = time_step_idx * time_step;
-            
-            applyBoundaryConditions();
-            computeTentativeVelocities();
-            const auto [sor_iterations, residual] = solverPressurePoisson();
-            applyPressureCorrection();
+        std::cout << GREEN << "Starting simulation..." << RESET << "\n";
+        for (int n = 1; n <= nsteps; ++n) {
+            const double t = n * dt;
 
-            if (time_step_idx % PRINT_INTERVAL == 0 || time_step_idx == total_time_steps) {
-                logStatistics(time_step_idx, current_time, sor_iterations);
-            }
-            
-            // Export data at specified intervals
-            if (time_step_idx % SAVE_DATA_INTERVAL == 0 || time_step_idx == total_time_steps) {
+            // Predictor (explicit conv-diff), then impose BCs on u*,v*
+            computeTentativeVelocities();
+            applyVelocityBC(u_star, v_star);
+
+            // PPE build & solve
+            buildRHS();
+            auto [iters, final_res] = solvePPE_SOR();
+
+            // Corrector, then re-impose velocity BCs (Dirichlet wins)
+            pressureCorrect();
+            applyVelocityBC(u, v);
+
+            if (n % PRINT_INTERVAL == 0 || n == nsteps) logStats(n, t, iters, final_res);
+            if (n % SAVE_INTERVAL  == 0 || n == nsteps) {
                 interpolateToCellCenters();
-                exportData(time_step_idx, current_time);
+                exportVTK(n, t);
             }
         }
-        
-        // Create ParaView collection file for animation
-        createParaviewCollection();
-        
-        std::cout << GREEN
-                  <<"Simulation completed successfully!\n"
-                  <<"VTK files saved in directory: " << output_directory << "\n"
-                  <<"Open '" << output_directory << "/channel_flow_animation.pvd' in ParaView for animation\n"
-                  << RESET;
+        writePVD();
+        std::cout << GREEN << "Done. Open '" << out_dir << "/channel_flow_animation.pvd' in ParaView." << RESET << "\n";
     }
 
 private:
-    /**
-     * @brief Validate input parameters for physical consistency
-     */
-    void validateParameters() const {
-        static_assert(n_interior > 0, "Grid size must be positive!");
-        static_assert(REYNOLDS_NUMBER > 0, "Reynolds number must be positive!");
-        static_assert(CFL > 0 && CFL < 1, "CFL number must be between 0 and 1!");
-        static_assert(final_time > 0, "Simulation time must be positive!");
-        
-        if (time_step <= 0) {
-            throw std::runtime_error("Computed time step is non-positive. Check physical parameters!");
-        }
+    void validate() const {
+        if (NX_INT <= 0 || NY_INT <= 0 || RE <= 0 || CFL <= 0.0 || CFL >= 1.0 || T_FINAL <= 0.0 || dt <= 0.0)
+            throw std::runtime_error("Invalid parameters");
     }
 
-    /**
-     * @brief Allocate memory for all flow fields
-     */
-    void allocateFields() {
-        try {
-            pressure          = createField(j_max + 2, i_max + 2);
-            source_term       = createField(j_max + 2, i_max + 2);
-            poisson_residual  = createField(j_max + 2, i_max + 2);
-            u_tentative       = createField(j_max + 2, i_max + 1);
-            u_corrected       = createField(j_max + 2, i_max + 1);
-            u_center          = createField(j_max + 2, i_max + 2);
-            v_tentative       = createField(j_max + 1, i_max + 2);
-            v_corrected       = createField(j_max + 1, i_max + 2);
-            v_center          = createField(j_max + 2, i_max + 2);
-        } catch (const std::exception& e) {
-            throw std::runtime_error("Failed to allocate memory for flow fields: " + std::string(e.what()));
-        }
+    void printHeader() const {
+        std::cout.setf(std::ios::fixed);
+        std::cout << std::setprecision(6);
+
+        std::cout << CYAN;
+        std::cout << "=== Channel Flow Simulation ===\n";
+        std::cout << "Domain: " << LENGTH << " x " << HEIGHT << "\n";
+        std::cout << "Grid:   " << nx << " x " << ny << "  (dx=" << dx << ", dy=" << dy << ")\n";
+        std::cout << "Time:   dt=" << dt << ", steps=" << nsteps << ", T_final=" << T_FINAL << "\n";
+        std::cout << "Re= " << RE << ", nu=" << nu << ", CFL=" << CFL << "\n";
+        std::cout << "SOR omega=" << omega << ", tol_factor=" << TOL_FACTOR << ", abs_tol=" << ABS_TOL << "\n";
+        std::cout << "VTK every " << SAVE_INTERVAL << " steps\n";
+        std::cout << "================================\n";
+        std::cout << RESET << "\n";
     }
 
-    /**
-     * @brief Setup output directory for VTK files
-     */
-    void setupOutputDirectory() {
-        try {
-            VTKWriter::create_output_directory(output_directory);
-            std::cout << BLUE << "Created output directory: " << output_directory << RESET << "\n";
-        } catch (const std::exception& e) {
-            throw std::runtime_error("Failed to setup output directory: " + std::string(e.what()));
-        }
+    // ========= Boundary Conditions =========
+    void applyVelocityBC(Field& uF, Field& vF) const noexcept {
+        // Inlet (x=0): u=U_IN (Dirichlet at u-face), v=0
+        for (int j = 1; j <= j_max; ++j) uF[j][0] = U_IN;
+        for (int j = 0; j <= j_max; ++j) vF[j][0] = 0.0;
+
+        // Outlet (x=L): zero-gradient for u,v
+        for (int j = 1; j <= j_max; ++j) uF[j][i_max]   = uF[j][i_max - 1];
+        for (int j = 0; j <= j_max; ++j) vF[j][i_max+1] = vF[j][i_max];
+
+        // Bottom wall (y=0): v=0 at face, u antisymmetric so wall value 0
+        for (int i = 1; i <= i_max; ++i) vF[0][i] = 0.0;
+        for (int i = 0; i <= i_max; ++i) uF[0][i] = -uF[1][i];
+
+        // Top wall (y=H): v=0 at face, u antisymmetric so wall value 0
+        for (int i = 1; i <= i_max; ++i) vF[j_max][i] = 0.0;
+        for (int i = 0; i <= i_max; ++i) uF[j_max+1][i] = -uF[j_max][i];
     }
 
-    /**
-     * @brief Export flow field data to VTK file
-     * @param time_step_idx Current time step index
-     * @param current_time Current simulation time
-     */
-    void exportData(int time_step_idx, double current_time) {
-        try {
-            const auto filename = VTKWriter::generate_filename("channel_flow", time_step_idx, current_time);
-            const auto filepath = output_directory + "/" + filename;
-            
-            VTKWriter::writeStructuredGrid(filepath, u_center, v_center, pressure, 
-                                            grid_spacing, n_interior, current_time);
-            
-            // Track exported files for collection
-            exported_vtk_files.push_back(filename);
-            exported_time_values.push_back(current_time);
-            
-            if (time_step_idx % PRINT_INTERVAL == 0 || time_step_idx == 0) {
-                std::cout << BLUE << "Exported VTK file: " << filename << RESET << "\n";
-            }
-        } catch (const std::exception& e) {
-            std::cerr << RED << "Error exporting VTK data: " << e.what() << RESET << "\n";
-        }
-    }
-    
-    /**
-     * @brief Create ParaView collection file for time series animation
-     */
-    void createParaviewCollection() {
-        try {
-            const auto collection_filepath = output_directory + "/channel_flow_animation.pvd";
-            VTKWriter::write_paraview_collection(collection_filepath, exported_vtk_files, exported_time_values);
-            
-            std::cout << CYAN << "Created ParaView collection file: channel_flow_animation.pvd" << RESET << "\n";
-        } catch (const std::exception& e) {
-            std::cerr << RED << "Error creating ParaView collection: " << e.what() << RESET << "\n";
-        }
-    }
-
-    /**
-     * @brief Print simulation parameters and setup information
-     */
-    void printSimulationInfo() const {
-        std::cout << std::fixed << std::setprecision(6);
-        std::cout << CYAN
-                  << "=== Channel Flow Simulation ===\n"
-                  << "Domain: " << LENGTH << "x" << HEIGHT << "\n"
-                  << "Grid: " << n_interior << "x" << n_interior 
-                  << " (spacing=" << grid_spacing << ")\n"
-                  << "Time: dt=" << time_step 
-                  << ", steps=" << total_time_steps 
-                  << ", final_time=" << final_time << "\n"
-                  << "Reynolds=" << REYNOLDS_NUMBER 
-                  << ", kinematic viscosity=" << kinematic_viscosity 
-                  << ", CFL=" << CFL << "\n"
-                  << "Relaxation factor=" << optimal_omega << "\n"
-                  << "VTK export interval=" << SAVE_DATA_INTERVAL << " steps\n"
-                  << "==========================================\n"
-                  << RESET << "\n";
-    }
-
-    /**
-     * @brief Apply boundary conditions using ghost cell method
-     */
-    void applyBoundaryConditions() noexcept {
-        // *************
-        // *** INLET ***
-        // *************
-        // u velocity (Dirichlet)
-        for (int j = 1; j <= j_max; ++j) {
-            u_corrected[j][0] = INLET_VELOCITY;
-        }
-        // v velocity (Dirichlet)
-        for (int j = 0; j <= j_max; ++j) {
-            v_corrected[j][0] = 0.0;
-        }
-
-        // **************
-        // *** OUTLET ***
-        // **************
-        // u velocity (Neumann)
-        for (int j = 1; j <= j_max; ++j) {
-            u_corrected[j][i_max] = u_corrected[j][i_max - 1];
-        }
-        // v velocity (Neumann)
-        for (int j = 0; j <= j_max; ++j) {
-            v_corrected[j][i_max + 1] = v_corrected[j][i_max];
-        }
-
-        // *************
-        // *** WALLS ***
-        // *************
-        // u velocity (North wall, Neumann)
-        for (int i = 0; i <= i_max; ++i) {
-            u_corrected[j_max + 1][i] = -u_corrected[j_max][i];
-        }
+    void applyPressureGhosts(Field& pF) const noexcept {
+        // Inlet Neumann: dp/dx = 0
+        for (int j = 1; j <= j_max; ++j) pF[j][0] = pF[j][1];
+        // Outlet Dirichlet at ghost: p = 0 (reference)
+        for (int j = 1; j <= j_max; ++j) pF[j][i_max+1] = 0.0;
+        // Walls Neumann: dp/dy = 0
         for (int i = 1; i <= i_max; ++i) {
-            v_corrected[j_max][i] = 0.0;
-        }
-
-        // u velocity  (South wall, Neumann)
-        for (int i = 0; i <= i_max; ++i) {
-            u_corrected[0][i] = -u_corrected[j_min][i];
-        }
-        for (int i = 1; i <= i_max; ++i) {
-            v_corrected[0][i] = 0.0;
+            pF[0][i]       = pF[1][i];
+            pF[j_max+1][i] = pF[j_max][i];
         }
     }
 
-    /**
-     * @brief Predictor step: compute tentative velocities without pressure gradient
-     */
+    // ========= Numerics =========
     void computeTentativeVelocities() noexcept {
-        const auto grid_spacing_inv = 1.0 / grid_spacing;
-        const auto grid_spacing_sq_inv = 1.0 / (grid_spacing * grid_spacing);
-        
-        // Compute u* (tentative u-velocity)
+        const double idx  = 1.0 / dx;
+        const double idy  = 1.0 / dy;
+        const double idx2 = 1.0 / (dx * dx);
+        const double idy2 = 1.0 / (dy * dy);
+
+        // u* on u-faces: j=1..j_max, i=1..i_max-1 (interior faces)
         for (int j = j_min; j <= j_max; ++j) {
             for (int i = i_min; i <= i_max - 1; ++i) {
-                // Viscous diffusion: ν∇²u
-                const auto diffusion_term = kinematic_viscosity * (
-                    (u_corrected[j][i+1] - 2.0*u_corrected[j][i] + u_corrected[j][i-1]) * grid_spacing_sq_inv +
-                    (u_corrected[j+1][i] - 2.0*u_corrected[j][i] + u_corrected[j-1][i]) * grid_spacing_sq_inv
-                );
-                
-                // Convective flux: ∂(u²)/∂x
-                const auto u_east       = 0.5 * (u_corrected[j][i]   + u_corrected[j][i+1]);
-                const auto u_west       = 0.5 * (u_corrected[j][i-1] + u_corrected[j][i]);
-                const auto convection_x = (u_east*u_east - u_west*u_west) * grid_spacing_inv;
-                
-                // Cross-stream convective flux: ∂(vu)/∂y
-                const auto v_north      = 0.5 * (v_corrected[j][i]   + v_corrected[j][i+1]);
-                const auto v_south      = 0.5 * (v_corrected[j-1][i] + v_corrected[j-1][i+1]);
-                const auto u_north      = 0.5 * (u_corrected[j+1][i] + u_corrected[j][i]);
-                const auto u_south      = 0.5 * (u_corrected[j-1][i] + u_corrected[j][i]);
-                const auto convection_y = (v_north*u_north - v_south*u_south) * grid_spacing_inv;
-                
-                // Forward Euler update
-                u_tentative[j][i] = u_corrected[j][i] + time_step * (diffusion_term - convection_x - convection_y);
+                // diffusion (2D anisotropic)
+                const double lap = (u[j][i+1] - 2.0*u[j][i] + u[j][i-1]) * idx2
+                                  + (u[j+1][i] - 2.0*u[j][i] + u[j-1][i]) * idy2;
+                // convective fluxes (central)
+                const double uE = 0.5 * (u[j][i]   + u[j][i+1]);
+                const double uW = 0.5 * (u[j][i-1] + u[j][i]);
+                const double conv_x = (uE*uE - uW*uW) * idx;
+
+                const double vN = 0.5 * (v[j][i]   + v[j][i+1]);
+                const double vS = 0.5 * (v[j-1][i] + v[j-1][i+1]);
+                const double uN = 0.5 * (u[j+1][i] + u[j][i]);
+                const double uS = 0.5 * (u[j-1][i] + u[j][i]);
+                const double conv_y = (vN*uN - vS*uS) * idy;
+
+                u_star[j][i] = u[j][i] + dt * (nu * lap - conv_x - conv_y);
             }
         }
 
-        // Compute v* (tentative v-velocity)
+        // v* on v-faces: j=1..j_max-1, i=1..i_max (interior faces)
         for (int j = j_min; j <= j_max - 1; ++j) {
-            for (int i = i_min; i <= i_max; ++i) {
-                // Viscous diffusion: ν∇²v
-                const auto diffusion_term = kinematic_viscosity * (
-                    (v_corrected[j][i+1] - 2.0*v_corrected[j][i] + v_corrected[j][i-1]) * grid_spacing_sq_inv +
-                    (v_corrected[j+1][i] - 2.0*v_corrected[j][i] + v_corrected[j-1][i]) * grid_spacing_sq_inv
-                );
+            for (int i = i_min; i <= i_max;   ++i) {
+                const double lap = (v[j][i+1] - 2.0*v[j][i] + v[j][i-1]) * idx2
+                                  + (v[j+1][i] - 2.0*v[j][i] + v[j-1][i]) * idy2;
+                const double vN = 0.5 * (v[j][i]   + v[j+1][i]);
+                const double vS = 0.5 * (v[j-1][i] + v[j][i]);
+                const double conv_y = (vN*vN - vS*vS) * idy;
 
-                // Convective flux: ∂(v²)/∂y
-                const auto v_north      = 0.5 * (v_corrected[j][i]   + v_corrected[j+1][i]);
-                const auto v_south      = 0.5 * (v_corrected[j-1][i] + v_corrected[j][i]);
-                const auto convection_y = (v_north*v_north - v_south*v_south) * grid_spacing_inv;
+                const double uE = 0.5 * (u[j][i]   + u[j+1][i]);
+                const double uW = 0.5 * (u[j][i-1] + u[j+1][i-1]);
+                const double vE = 0.5 * (v[j][i]   + v[j][i+1]);
+                const double vW = 0.5 * (v[j][i-1] + v[j][i]);
+                const double conv_x = (uE*vE - uW*vW) * idx;
 
-                // Cross-stream convective flux: ∂(uv)/∂x
-                const auto u_east       = 0.5 * (u_corrected[j][i]   + u_corrected[j+1][i]);
-                const auto u_west       = 0.5 * (u_corrected[j][i-1] + u_corrected[j+1][i-1]);
-                const auto v_east       = 0.5 * (v_corrected[j][i]   + v_corrected[j][i+1]);
-                const auto v_west       = 0.5 * (v_corrected[j][i-1] + v_corrected[j][i]);
-                const auto convection_x = (u_east*v_east - u_west*v_west) * grid_spacing_inv;
-
-                // Forward Euler update
-                v_tentative[j][i] = v_corrected[j][i] + time_step * (diffusion_term - convection_y - convection_x);
+                v_star[j][i] = v[j][i] + dt * (nu * lap - conv_y - conv_x);
             }
         }
     }
 
-    /**
-     * @brief Solve pressure Poisson equation using SOR iteration
-     * @return Pair of (iterations, final_residual)
-     */
-    [[nodiscard]] SolverResult solverPressurePoisson() {
-        auto pressure_old = createField(j_max + 2, i_max + 2);
-        auto pressure_new = createField(j_max + 2, i_max + 2);
-        
-        const auto grid_spacing_inv = 1.0 / grid_spacing;
-        const auto grid_spacing_sq_inv = 1.0 / (grid_spacing * grid_spacing);
-        const auto time_step_inv = 1.0 / time_step;
-        
-        auto max_source_term = 0.0;
-        auto max_poisson_residual = 1.0;  // Initialize > 0 to enter loop
-        auto iteration_count = 0;
+    void buildRHS() noexcept {
+        const double idx = 1.0 / dx, idy = 1.0 / dy;
+        const double coeff = RHO / dt;
+        double max_rhs = 0.0;
 
-        // Compute source term
         for (int j = j_min; j <= j_max; ++j) {
             for (int i = i_min; i <= i_max; ++i) {
-                source_term[j][i] = time_step_inv * DENSITY * (
-                    (u_tentative[j][i] - u_tentative[j][i-1]) * grid_spacing_inv +
-                    (v_tentative[j][i] - v_tentative[j-1][i]) * grid_spacing_inv
-                );
-                max_source_term = std::max(max_source_term, std::abs(source_term[j][i]));
+                rhs[j][i] = coeff * ((u_star[j][i] - u_star[j][i-1]) * idx
+                                    + (v_star[j][i] - v_star[j-1][i]) * idy);
+                max_rhs = std::max(max_rhs, std::abs(rhs[j][i]));
             }
         }
+        // Optional: remove tiny mean to aid convergence
+        if (max_rhs > 0) {
+            double mean_rhs = 0.0; int cnt = 0;
+            for (int j = j_min; j <= j_max; ++j)
+                for (int i = i_min; i <= i_max; ++i) { mean_rhs += rhs[j][i]; ++cnt; }
+            mean_rhs /= static_cast<double>(cnt);
+            for (int j = j_min; j <= j_max; ++j)
+                for (int i = i_min; i <= i_max; ++i) rhs[j][i] -= mean_rhs;
+        }
+    }
 
-        const auto tolerance = TOLERANCE_FACTOR * max_source_term;
+    SolverResult solvePPE_SOR() {
+        Field p_new = p; // start from previous p
+        Field p_prev = p_new; // for GS east/north lookups
+        const double idx2 = 1.0 / (dx * dx);
+        const double idy2 = 1.0 / (dy * dy);
+        const double denom = 2.0 * (idx2 + idy2);
 
-        // SOR iteration loop
-        while ((max_poisson_residual > tolerance) && (iteration_count < MAX_SOR_ITERS)) {
-            ++iteration_count;
-            pressure_old.swap(pressure_new);
+        // tolerance based on RHS magnitude
+        double max_rhs = 0.0;
+        for (int j = j_min; j <= j_max; ++j)
+            for (int i = i_min; i <= i_max; ++i)
+                max_rhs = std::max(max_rhs, std::abs(rhs[j][i]));
+        const double tol = std::max(TOL_FACTOR * (max_rhs > 0 ? max_rhs : 1.0), ABS_TOL);
 
-            // SOR update sweep
+        double max_res = tol + 1.0;
+        int it = 0;
+
+        while (max_res > tol && it < MAX_SOR_ITERS) {
+            ++it;
+            p_prev = p_new; // capture state for GS east/north
+
+            // Update interior with SOR (anisotropic 5-pt Laplacian, GS ordering)
             for (int j = j_min; j <= j_max; ++j) {
                 for (int i = i_min; i <= i_max; ++i) {
+                    const double pW = p_new[j][i-1];
+                    const double pE = p_prev[j][i+1];
+                    const double pS = p_new[j-1][i];
+                    const double pN = p_prev[j+1][i];
 
-                    // Indicator functions
-                    int eps_w = 1;   // West neighbor
-                    int eps_e = 1;   // East neighbor  
-                    int eps_n = 1;   // North neighbor
-                    int eps_s = 1;   // South neighbor
-                    int neighbor_count = eps_w + eps_e + eps_n + eps_s;
-                    
-                    // SOR update
-                    pressure_new[j][i] = pressure_old[j][i] * (1.0 - optimal_omega) + (optimal_omega / neighbor_count) * (
-                        (eps_e*pressure_old[j][i+1] + eps_w*pressure_new[j][i-1]) + 
-                        (eps_n*pressure_old[j+1][i] + eps_s*pressure_new[j-1][i]) - source_term[j][i] * (grid_spacing * grid_spacing)
-                    );
+                    const double sumNbrs = idx2 * (pE + pW) + idy2 * (pN + pS);
+                    const double p_gs = (sumNbrs - rhs[j][i]) / denom;
+                    p_new[j][i] = (1.0 - omega) * p_new[j][i] + omega * p_gs;
                 }
             }
+            // Refresh ghosts based on BCs
+            applyPressureGhosts(p_new);
 
-            // Pressure BC:
-            // inlet: ∂p/∂x = 0
-            for (int j = 1; j <= j_max; ++j) {
-                pressure_new[j][0] = pressure_new[j][1];
-            }
-            // outlet: ∂p/∂x = 0
-            for (int j = 1; j <= j_max; ++j) {
-                pressure_new[j][i_max+1]  = 0.0;
-                pressure_new[j][i_max]  = 0.0;
-            }
-            // south wall: ∂p/∂y = 0
-            for (int i = 1; i <= i_max; ++i) {
-                pressure_new[0][i] = pressure_new[1][i];
-            }
-            // north wall: ∂p/∂y = 0
-            for (int i = 1; i <= i_max; ++i) {
-                pressure_new[j_max+1][i] = pressure_new[j_max][i];
-            }
-
-
-            // Compute residual norm every iteration
-            max_poisson_residual = 0.0;
+            // Residual (infty-norm of PPE)
+            max_res = 0.0;
             for (int j = j_min; j <= j_max; ++j) {
                 for (int i = i_min; i <= i_max; ++i) {
-
-                    // Indicator functions
-                    int eps_w = 1;   // West neighbor
-                    int eps_e = 1;   // East neighbor  
-                    int eps_n = 1;   // North neighbor
-                    int eps_s = 1;   // South neighbor
-                    int neighbor_count = eps_w + eps_e + eps_n + eps_s;
-
-                    // Compute residual
-                    poisson_residual[j][i] = grid_spacing_sq_inv * (
-                        eps_e*(pressure_new[j][i+1] - pressure_new[j][i]) + eps_w*(pressure_new[j][i-1] - pressure_new[j][i]) + 
-                        eps_n*(pressure_new[j+1][i] - pressure_new[j][i]) + eps_s*(pressure_new[j-1][i] - pressure_new[j][i])
-                    ) - source_term[j][i];
-
-                    max_poisson_residual = std::max(max_poisson_residual, std::abs(poisson_residual[j][i]));
+                    const double lap = (p_new[j][i+1] - 2.0*p_new[j][i] + p_new[j][i-1]) * idx2
+                                      + (p_new[j+1][i] - 2.0*p_new[j][i] + p_new[j-1][i]) * idy2;
+                    res[j][i] = lap - rhs[j][i];
+                    max_res = std::max(max_res, std::abs(res[j][i]));
                 }
             }
         }
-
-        // Check for convergence issues
-        if (iteration_count >= MAX_SOR_ITERS) {
-            std::cerr << "Warning: SOR solver did not converge in " << MAX_SOR_ITERS 
-                      << " iterations. Final residual: " << max_poisson_residual << "\n";
+        if (it >= MAX_SOR_ITERS) {
+            std::cerr << YELLOW << "Warning: PPE SOR hit max iterations, max_res=" << max_res << RESET << "\n";
         }
-
-        // Update global pressure field
-        pressure = std::move(pressure_new);
-
-        return {iteration_count, max_poisson_residual};
+        p.swap(p_new);
+        return {it, max_res};
     }
 
-    /**
-     * @brief Corrector step: apply pressure gradient to get final velocities
-     */
-    void applyPressureCorrection() noexcept {
-        const auto dt_over_h = time_step / grid_spacing;
-        
-        // Correct u-velocities
-        for (int j = j_min; j <= j_max; ++j) {
-            for (int i = i_min; i <= i_max - 1; ++i) {
-                u_corrected[j][i] = u_tentative[j][i] - dt_over_h * DENSITY * (pressure[j][i+1] - pressure[j][i]);
-            }
-        }
-        
-        // Correct v-velocities  
-        for (int j = j_min; j <= j_max - 1; ++j) {
-            for (int i = i_min; i <= i_max; ++i) {
-                v_corrected[j][i] = v_tentative[j][i] - dt_over_h * DENSITY * (pressure[j+1][i] - pressure[j][i]);
-            }
-        }
+    void pressureCorrect() noexcept {
+        // u-correction on interior u-faces
+        for (int j = j_min; j <= j_max; ++j)
+            for (int i = i_min; i <= i_max - 1; ++i)
+                u[j][i] = u_star[j][i] - (dt / (RHO * dx)) * (p[j][i+1] - p[j][i]);
+        // v-correction on interior v-faces
+        for (int j = j_min; j <= j_max - 1; ++j)
+            for (int i = i_min; i <= i_max;   ++i)
+                v[j][i] = v_star[j][i] - (dt / (RHO * dy)) * (p[j+1][i] - p[j][i]);
     }
 
-    /**
-     * @brief Interpolate staggered velocities to cell centers
-     * @return Pair of (u_center, v_center) fields
-     */
-    [[nodiscard]] VelocityFields interpolateToCellCenters() noexcept {
-        // Interpolate u-velocity to cell centers
-        for (int j = j_min; j <= j_max; ++j) {
-            for (int i = i_min; i <= i_max; ++i) {
-                u_center[j][i] = 0.5 * (u_corrected[j][i-1] + u_corrected[j][i]);
-            }
-        }
-        
-        // Interpolate v-velocity to cell centers
-        for (int j = j_min; j <= j_max; ++j) {
-            for (int i = i_min; i <= i_max; ++i) {
-                v_center[j][i] = 0.5 * (v_corrected[j-1][i] + v_corrected[j][i]);
-            }
-        }
-        
-        return {u_center, v_center};
+    VelocityFields interpolateToCellCenters() noexcept {
+        for (int j = j_min; j <= j_max; ++j)
+            for (int i = i_min; i <= i_max; ++i)
+                u_cc[j][i] = 0.5 * (u[j][i-1] + u[j][i]);
+        for (int j = j_min; j <= j_max; ++j)
+            for (int i = i_min; i <= i_max; ++i)
+                v_cc[j][i] = 0.5 * (v[j-1][i] + v[j][i]);
+        return {u_cc, v_cc};
     }
 
-    /**
-     * @brief Compute and print flow statistics
-     * @param step_number Current time step
-     * @param current_time Current simulation time
-     * @param sor_iterations Number of SOR iterations used
-     */
-    void logStatistics(int step_number, double current_time, int sor_iterations) {
-        const auto [u_center, v_center] = interpolateToCellCenters();
-        
-        auto max_divergence = 0.0;
-        auto total_kinetic_energy = 0.0;
-        
-        const auto grid_spacing_inv = 1.0 / grid_spacing;
+    void logStats(int step, double t, int iters, double max_res) {
+        interpolateToCellCenters();
+        const double idx = 1.0 / dx, idy = 1.0 / dy;
+        double max_div = 0.0, KE = 0.0;
+        for (int j = j_min; j <= j_max; ++j) {
+            for (int i = i_min; i <= i_max; ++i) {
+                const double div = (u[j][i] - u[j][i-1]) * idx + (v[j][i] - v[j-1][i]) * idy;
+                max_div = std::max(max_div, std::abs(div));
+                KE += 0.5 * (u_cc[j][i]*u_cc[j][i] + v_cc[j][i]*v_cc[j][i]);
+            }
+        }
+        KE /= (nx * ny);
+        std::cout << "Step " << std::setw(6) << step << "/" << nsteps
+                  << " | t=" << std::fixed << std::setprecision(3) << std::setw(8) << t
+                  << " | max(div)=" << std::scientific << std::setprecision(2) << std::setw(10) << max_div
+                  << " | avg_KE=" << std::fixed << std::setprecision(6) << std::setw(10) << KE
+                  << " | PPE iters=" << std::setw(4) << iters
+                  << " | res=" << std::scientific << std::setprecision(2) << std::setw(10) << max_res
+                  << "\n";
+    }
 
-        // Compute velocity statistics and kinetic energy
-        for (int j = j_min; j <= j_max; ++j) {
-            for (int i = i_min; i <= i_max; ++i) {
-                total_kinetic_energy += 0.5 * (u_center[j][i] * u_center[j][i] + 
-                                              v_center[j][i] * v_center[j][i]);
-            }
-        }
-        
-        // Divergence check using staggered grid velocities
-        for (int j = j_min; j <= j_max; ++j) {
-            for (int i = i_min; i <= i_max; ++i) {
-                const auto divergence = (u_corrected[j][i] - u_corrected[j][i-1] + 
-                                       v_corrected[j][i] - v_corrected[j-1][i]) * grid_spacing_inv;
-                max_divergence = std::max(max_divergence, std::abs(divergence));
-            }
-        }
-        
-        const auto average_kinetic_energy = total_kinetic_energy / (n_interior * n_interior);
-        
-        // Print formatted statistics
-        std::cout << "Step " << std::setw(6) << step_number << "/" << total_time_steps
-                  << " | t=" << std::fixed << std::setprecision(2) << std::setw(6) << current_time 
-                  << " | max(div)=" << std::setprecision(2) << std::scientific << std::setw(10) << max_divergence
-                  << " | avg_KE=" << std::fixed << std::setprecision(6) << std::setw(10) << average_kinetic_energy
-                  << " | SOR_iters=" << std::setw(4) << sor_iterations << "\n";
+    void exportVTK(int step, double t) {
+        const std::string fname = VTKWriter::generate_filename("channel_flow", step);
+        const std::string path  = out_dir + "/" + fname;
+        VTKWriter::writeStructuredGrid(path, u_cc, v_cc, p, nx, ny, dx, dy, t);
+        if (step % PRINT_INTERVAL == 0 || step == 0) std::cout << BLUE << "Export: " << fname << RESET << "\n";
+        vtk_files.push_back(fname);
+        vtk_times.push_back(t);
+    }
+
+    void writePVD() const {
+        VTKWriter::write_paraview_collection(out_dir + "/channel_flow_animation.pvd", vtk_files, vtk_times);
     }
 };
-}
 
-/**
- * @brief Main function - entry point for the simulation
- */
+} // namespace ChannelFlow
+
 int main() {
     try {
         ChannelFlow::ChannelSolver solver;
         solver.run();
         return 0;
-    }
-    catch (const std::exception& e) {
-        std::cerr << "Error: " << e.what() << "\n";
+    } catch (const std::exception& e) {
+        std::cerr << ChannelFlow::RED << "Error: " << e.what() << ChannelFlow::RESET << "\n";
         return 1;
-    }
-    catch (...) {
-        std::cerr << "Unknown error occurred\n";
+    } catch (...) {
+        std::cerr << ChannelFlow::RED << "Unknown error\n" << ChannelFlow::RESET;
         return 1;
     }
 }
