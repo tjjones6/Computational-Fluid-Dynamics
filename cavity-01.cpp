@@ -1,6 +1,6 @@
 /**
  * @file    cavity-01.cpp
- * @brief   Fully-explicit, staggered-grid, projection method lid-driven cavity solver
+ * @brief   Incompressible lid-driven cavity solver: Fully-explicit, staggered-grid, projection method
  *
  * @details
  *  • Time scheme:    Forward Euler  
@@ -794,5 +794,6 @@ int main() {
     }
 
 }
+
 
 
