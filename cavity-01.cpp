@@ -1,13 +1,13 @@
 /**
  * @file    cavity-01.cpp
- * @brief   Incompressible lid-driven cavity solver: Fully-explicit, staggered-grid, projection method
+ * @brief   Unsteady lid-driven cavity solver: Fully-explicit projection method on a staggered grid
  *
  * @details
- *  • Time scheme:    Forward Euler  
- *  • Diffusion:      2nd-order central  
- *  • Convection:     1st-order central  
- *  • Pressure solver: SOR  
- *  • Output:         VTK files for ParaView with animation support
+ *  - Time scheme:    Forward Euler  
+ *  - Diffusion:      2nd-order central  
+ *  - Convection:     1st-order central  
+ *  - Pressure solver: SOR  
+ *  - Output:         VTK files of flow field data
  *
  * @author Tyler Jones
  * @date   2025-07-28
@@ -794,6 +794,7 @@ int main() {
     }
 
 }
+
 
 
 
