@@ -8,7 +8,7 @@
 ![Channel CFD](channel-re100.png)
 
 # Rayleigh–Bénard Convection
-![Channel CFD](channel-re100.png)
+![RB CFD]RB.jpg)
 
 
 # Inlet Box
