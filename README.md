@@ -8,7 +8,8 @@
 ![Channel CFD](channel-re100.png)
 
 # Rayleigh–Bénard Convection
-
+![RB CFD](RB1.gif)
+![RB CFD](RB!_FTLE.gif)
 
 # Inlet Box
 This simulation was run in OpenFOAM with a tetrahedral mesh (~300k elements).  
