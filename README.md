@@ -1,5 +1,4 @@
 # Lid-Driven Cavity
-
 2D unsteady incompressible lid-driven cavity problem programmed in C++ using a projection scheme
 ![Cavity CFD](cavity-re100.png)
 
@@ -8,9 +7,11 @@
 2D unsteady incompressible channel flow problem programmed in C++ using a projection scheme
 ![Channel CFD](channel-re100.png)
 
+# Rayleigh–Bénard Convection
+![Channel CFD](channel-re100.png)
+
 
 # Inlet Box
-
 This simulation was run in OpenFOAM with a tetrahedral mesh (~300k elements).  
 Below are streamline (left) and pressure (right) visualizations:
 
