@@ -1,7 +1,7 @@
 # Lid-Driven Cavity
 
 The unsteady incompressible lid-driven cavity problem programmed in C++ using a projection scheme
-
+![Cavity CFD](cavity-re100.png)
 
 
 # Inlet Box
