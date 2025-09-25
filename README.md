@@ -2,7 +2,6 @@
 [![C++](https://img.shields.io/badge/C%2B%2B-17-blue)]()
 [![OpenFOAM](https://img.shields.io/badge/OpenFOAM-2312-8A2BE2)]()
 [![Numerics](https://img.shields.io/badge/Numerics-FDM/FVM-green)]()
-[![License](https://img.shields.io/badge/License-MIT-lightgrey)]()
 
 High-fidelity toy solvers + industrial cases: clean numerics, reproducible setups, and crisp visuals.
 
