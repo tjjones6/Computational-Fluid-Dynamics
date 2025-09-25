@@ -8,7 +8,7 @@ High-fidelity toy solvers + industrial cases: clean numerics, reproducible setup
 <p align="center">
   <img src="RB1.gif" alt="Rayleigh–Bénard convection" width="320">
   <img src="RB1_FTLE.gif" alt="Finite-time Lyapunov exponent RB" width="320">
-  <img src="cavity-re100.png" alt="Lid-driven cavity Re=100" width="320">
+  <img src="cavity-re100.gif" alt="Lid-driven cavity Re=100" width="320">
 </p>
 
 ---
