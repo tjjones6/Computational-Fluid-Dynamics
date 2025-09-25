@@ -3,8 +3,6 @@
 [![OpenFOAM](https://img.shields.io/badge/OpenFOAM-2312-8A2BE2)]()
 [![Numerics](https://img.shields.io/badge/Numerics-FDM/FVM-green)]()
 
-High-fidelity toy solvers + industrial cases: clean numerics, reproducible setups, and crisp visuals.
-
 <p align="center">
   <img src="RB1.gif" alt="Rayleigh–Bénard convection" width="320">
   <img src="RB1_FTLE.gif" alt="Finite-time Lyapunov exponent RB" width="320">
