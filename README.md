@@ -12,8 +12,9 @@
 ---
 
 ## Contents
-- [Lid-Driven Cavity (C++, Projection)](#lid-driven-cavity-c-projection)
-- [Channel Flow (C++, Projection)](#channel-flow-c-projection)
+- [Lid-Driven Cavity (C++)](#lid-driven-cavity)
+- [Channel Flow (C++)](#channel-flow)
+- [Backwards Facing Step (C++)](#channel-flow)
 - [Rayleigh–Bénard Convection](#rayleigh–bénard-convection)
 - [Inlet Box (OpenFOAM)](#inlet-box-openfoam)
 - [Run It / Reproducibility](#run-it--reproducibility)
@@ -22,7 +23,7 @@
 
 ---
 
-## Lid-Driven Cavity (C++, Projection)
+## Lid-Driven Cavity (C++)
 2D unsteady incompressible cavity; projection method; centerline validation vs. Ghia et al.
 
 <p align="center">
@@ -41,7 +42,7 @@
 
 ---
 
-## Channel Flow (C++, Projection)
+## Channel Flow (C++)
 2D channel; start-up transient to fully developed profile; compares with analytic Poiseuille.
 
 <p align="center">
@@ -53,7 +54,23 @@
 
 - **Inlet**: fixed U or flow-rate; **Outlet**: ∂/∂x = 0.
 - **Validation**: parabolic profile; friction factor vs. Re.
-- **Todo**: add periodic domain variant, drag coefficient plot.
+
+</details>
+
+---
+
+## Backwards Facing Step (C++)
+2D channel with a step at the inlet
+
+<p align="center">
+  <img src="backwards_step-re100-streamlines.png" alt="Backwards Facing Step" width="480">
+</p>
+
+<details>
+<summary><b>Details</b></summary>
+
+- **Inlet**: fixed U or flow-rate; **Outlet**: ∂/∂x = 0.
+- **Validation**: parabolic profile; friction factor vs. Re.
 
 </details>
 
