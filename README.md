@@ -63,7 +63,7 @@
 2D channel with a step at the inlet
 
 <p align="center">
-  <img src="backwards_step-re100-streamlines.png" alt="Backwards Facing Step" width="480">
+  <img src="backwards_step-re100.png" alt="Backwards Facing Step" width="480">
 </p>
 
 <details>
