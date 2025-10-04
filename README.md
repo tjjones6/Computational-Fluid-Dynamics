@@ -100,8 +100,9 @@ Industrial duct elbow; tetra mesh (~300k); streamlines + pressure contours.
 
 <table>
 <tr>
-<td><img src="INLET_BOX.png" alt="Inlet box streamlines" width="420"></td>
-<td><img src="INLET_BOX-CONTOURS.png" alt="Inlet box pressure contours" width="420"></td>
+<td><img src="mesh.png" alt="Inlet box streamlines" width="420"></td>
+<td><img src="Velocity-streamlines-contour.png" alt="Inlet box streamlines" width="420"></td>
+<td><img src="pressure-contours.png" alt="Inlet box streamlines" width="420"></td>
 </tr>
 </table>
 
