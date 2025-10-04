@@ -95,7 +95,7 @@ Thermal convection visualizations and diagnostics (FTLE).
 
 ---
 
-## Inlet Box (OpenFOAM)
+## Industrial Ductwork (OpenFOAM)
 Industrial duct elbow; tetra mesh (~300k); streamlines + pressure contours.
 
 <table>
